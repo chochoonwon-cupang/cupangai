@@ -88,6 +88,28 @@ P = 18   # 카드 padding
 BASE_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 API_KEYS_FILE = os.path.join(BASE_DIR, ".api_keys.json")
 CAFE_SETTINGS_FILE = os.path.join(BASE_DIR, "cafe_settings.json")
+GUI_VM_CONFIG = os.path.join(BASE_DIR, "configs", "gui_vm.json")
+
+
+def _load_gui_vm_config():
+    """configs/gui_vm.json 로드 → env 보완. Returns: {VM_NAME, COMM_USER_ID}"""
+    out = {"VM_NAME": "", "COMM_USER_ID": ""}
+    out["VM_NAME"] = (os.environ.get("VM_NAME") or os.environ.get("WORKER_NAME") or "").strip()
+    out["COMM_USER_ID"] = (os.environ.get("COMM_USER_ID") or "").strip()
+    try:
+        if os.path.isfile(GUI_VM_CONFIG):
+            with open(GUI_VM_CONFIG, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            out["VM_NAME"] = (data.get("VM_NAME") or data.get("vm_name") or out["VM_NAME"] or "").strip()
+            out["COMM_USER_ID"] = (data.get("COMM_USER_ID") or data.get("comm_user_id") or out["COMM_USER_ID"] or "").strip()
+    except Exception:
+        pass
+    return out
+
+
+def _load_gui_vm_name():
+    """VM 이름만 반환 (하위 호환)"""
+    return _load_gui_vm_config()["VM_NAME"]
 
 
 # ================================================================
@@ -579,8 +601,8 @@ class App:
         style.configure("Treeview.Heading", background="#e0f2fe", foreground=FG)
 
         self.keywords = []
-        self.is_running = False
         self.results = {}
+        self.is_running = False  # 상품 검색 실행 중
         self._stop_flag = False
         self.cafe_list = []
         self.is_posting = False
@@ -592,17 +614,10 @@ class App:
         self._auto_restart_minute = 0    # 기본 00분
         self._auto_restart_blog = False  # 블로그 자동재시작
         self._auto_restart_cafe = True   # 카페 자동재시작 (기본)
-        self._agent_use_new_cafe_list = False  # SaaS 서버뉴카페 체크 시 agent_cafe_lists 사용
         self._auto_restart_timer_id = None
         self._auto_restart_daily = True  # 매일 반복
         self._auto_restart_pending_cafe = False  # 블로그→카페 순차 실행용
 
-        # 에이전트 모드 (SaaS 비서 모드 — 1분마다 tasks 테이블 확인)
-        self._agent_poll_timer_id = None
-        # 에이전트모드 실행 (agent_commands + agent_configs)
-        self._agent_exec_var = tk.BooleanVar(value=False)
-        self._agent_cmd_poll_timer_id = None
-        self._agent_heartbeat_timer_id = None
         self.worker_thread = None
 
         self.app_links = {}
@@ -642,29 +657,54 @@ class App:
         # 2) Supabase 데이터 — 백그라운드 스레드에서 로드
         def _fetch():
             try:
-                from supabase_client import fetch_app_links, fetch_banners
+                from shared.gui_data import fetch_app_links, fetch_banners, get_admin_settings, get_cafe_targets
                 links = fetch_app_links()
                 banners = fetch_banners()
+                admin_ok, cafe_ok = False, False
+                admin_settings = {}
+                cafe_targets = []
                 helper_cafes = []
                 helper_since = None
                 try:
-                    from supabase_client import fetch_helper_cafes, fetch_helper_new_cafe_since
-                    helper_cafes = fetch_helper_cafes()
-                    helper_since = fetch_helper_new_cafe_since()
+                    admin_settings = get_admin_settings()
+                    admin_ok = bool(admin_settings)
+                    cafe_targets = get_cafe_targets()
+                    cafe_ok = bool(cafe_targets)
                 except Exception:
                     pass
-                self.root.after(0, lambda: self._apply_fetched_data(links, banners, helper_cafes, helper_since))
-            except Exception:
-                pass
+                try:
+                    from shared.gui_data import fetch_helper_cafes, fetch_helper_new_cafe_since
+                    helper_cafes = fetch_helper_cafes()
+                    helper_since = fetch_helper_new_cafe_since()
+                    if not cafe_targets and helper_cafes:
+                        cafe_targets = [{"cafe_id": c.get("cafe_id"), "menu_id": c.get("menu_id"), "name": c.get("cafe_id")} for c in helper_cafes]
+                        cafe_ok = bool(cafe_targets)
+                except Exception:
+                    pass
+                print(f"[GUI] get_admin_settings={'OK' if admin_ok else 'FAIL'}, get_cafe_targets={'OK' if cafe_ok else 'FAIL'}", flush=True)
+                self.root.after(0, lambda: self._apply_fetched_data(links, banners, helper_cafes, helper_since, admin_settings, cafe_targets))
+            except Exception as ex:
+                print(f"[GUI] Supabase fetch 실패: {ex}", flush=True)
         threading.Thread(target=_fetch, daemon=True).start()
 
-    def _apply_fetched_data(self, links, banners, helper_cafes=None, helper_since=None):
+    def _apply_fetched_data(self, links, banners, helper_cafes=None, helper_since=None, admin_settings=None, cafe_targets=None):
         """Supabase에서 가져온 데이터 적용 (메인 스레드)"""
         self.app_links = links or {}
         self.banners = banners or []
         self.helper_cafes = helper_cafes if helper_cafes is not None else getattr(self, "helper_cafes", [])
         self.helper_new_cafe_since = helper_since if helper_since is not None else getattr(self, "helper_new_cafe_since", None)
+        self._admin_settings = admin_settings or {}
+        self._cafe_targets_readonly = cafe_targets or []
         self._compute_helper_new_cafes()
+        # [C] 관리자 설정: gemini_key, captcha_key — Supabase에서 있으면 적용, 읽기 전용
+        gk = self._admin_settings.get("gemini_key") or self._admin_settings.get("gemini_api_key", "")
+        if gk and hasattr(self, "gemini_key_var"):
+            self.gemini_key_var.set(gk)
+            if hasattr(self, "gemini_entry"):
+                self.gemini_entry.config(state="readonly")
+        ck = self._admin_settings.get("captcha_key") or self._admin_settings.get("captcha_api_key", "")
+        if ck:
+            self._cafe_autojoin_captcha_key = ck
         if self.banners and hasattr(self, "_banner_rotate_start"):
             self._banner_rotate_start()
         if hasattr(self, "helper_cafe_count_label") and self.helper_cafe_count_label.winfo_exists():
@@ -700,14 +740,24 @@ class App:
         row = tk.Frame(card, bg=BG_CARD)
         row.pack(fill="x", padx=6, pady=4)
 
-        # 에이전트모드 실행 체크박스 (상단)
-        self._agent_exec_cb = tk.Checkbutton(
-            row, text="  에이전트모드 실행  ",
-            variable=self._agent_exec_var, font=F_SM, bg=BG_CARD, fg=FG,
-            activebackground=BG_CARD, activeforeground=FG, selectcolor=BG_CARD,
-            command=self._on_agent_exec_toggle,
+        # 통신시작 체크박스 (post_tasks 폴링 → 새 키워드 등록 시 글 작성)
+        self._comm_enabled_var = tk.BooleanVar(value=False)
+        self._comm_cb = tk.Checkbutton(
+            row, text=" 통신시작 ", variable=self._comm_enabled_var,
+            font=F_SM, bg=BG_CARD, fg=FG, activebackground=BG_CARD,
+            selectcolor=BG_CARD, command=self._on_comm_toggle,
         )
-        self._agent_exec_cb.pack(side="left", padx=(0, S))
+        self._comm_cb.pack(side="left", padx=(0, S))
+
+        # VM 이름 (다중 VM 시 각 PC별 식별자 — configs/gui_vm.json 또는 env VM_NAME)
+        tk.Label(row, text="VM:", font=F_SM, bg=BG_CARD, fg=FG_LABEL).pack(side="left", padx=(S, 2))
+        self._comm_vm_name_var = tk.StringVar(value=_load_gui_vm_name())
+        _vm_entry = tk.Entry(row, textvariable=self._comm_vm_name_var, font=F_SM, width=10, bg=BG_INPUT)
+        _vm_entry.pack(side="left", padx=(0, 2))
+        _vm_entry.bind("<FocusOut>", lambda e: self._save_gui_vm_config())
+
+        # 실행 시작 (post_tasks enqueue)
+        _action_btn(row, " 실행 시작 ", GREEN, GREEN_H, self._on_enqueue_start).pack(side="left", padx=(0, S))
 
         self._tab_btns = {}
         self._cur_tab = "search"
@@ -725,6 +775,9 @@ class App:
         # 회원가입 / 로그인 / 로그아웃 버튼
         self._auth_available = False
         self._auth_session_id = None
+        self.current_user_id = None  # Supabase Auth user_id (enqueue_post_tasks 등에서 사용)
+        self._comm_stop_flag = False
+        self._comm_poll_thread = None
         try:
             from auth import is_logged_in, get_session, get_free_use_until, logout
             self._auth_available = True
@@ -751,14 +804,14 @@ class App:
         else:
             self.pg_cafe.pack(fill="both", expand=True)
 
-    # ── 공용 에이전트 로그 (항상 표시, 탭 무관) ──
+    # ── 공용 실행 로그 (항상 표시, 탭 무관) ──
     def _build_global_log(self, parent):
         sh, card = _card(parent, pad=8)
         sh.pack(fill="x", pady=(S, 0))
 
         row = tk.Frame(card, bg=BG_CARD)
         row.pack(fill="x", padx=12, pady=(8, 4))
-        tk.Label(row, text="에이전트 활동 내역", font=F_SEC, bg=BG_CARD,
+        tk.Label(row, text="실행 로그", font=F_SEC, bg=BG_CARD,
                  fg=FG, anchor="w").pack(side="left")
         _action_btn(row, " 로그 지우기 ", ORANGE, ORANGE_H, self._clear_global_log).pack(side="right")
         _sep(card)
@@ -776,7 +829,7 @@ class App:
         self.global_log_text.pack(fill="both", expand=True)
 
     def append_log_global(self, msg):
-        """에이전트 모드 관련 로그([AGENT],[BLOG],[CAFE]) — 탭과 무관하게 항상 공용 로그에 출력"""
+        """실행 로그 — 탭과 무관하게 항상 공용 로그에 출력"""
         print(msg)
         def _do():
             if getattr(self, "global_log_text", None) and self.global_log_text.winfo_exists():
@@ -1119,25 +1172,33 @@ class App:
 
         # ── 쿠팡 파트너스 API ──
         r = 0
-        self._lbl(form, "쿠팡 Access Key:", r)
         cak = tk.Frame(form, bg=BG_CARD)
-        cak.grid(row=r, column=1, sticky="ew", pady=8)
+        cak.grid(row=r, column=0, columnspan=2, sticky="ew", pady=8)
+        cak.columnconfigure(0, weight=1)
+        tk.Label(cak, text="Access Key 등록", font=F_SM, bg=BG_CARD,
+                 fg=FG_LABEL, anchor="w").pack(fill="x")
+        cak_row = tk.Frame(cak, bg=BG_CARD)
+        cak_row.pack(fill="x")
         self.coupang_ak_var = tk.StringVar()
         self.coupang_ak_var.trace_add("write", lambda *_: self._auto_save_api_keys())
-        self.coupang_ak_entry = _entry(cak, self.coupang_ak_var, show="●")
+        self.coupang_ak_entry = _entry(cak_row, self.coupang_ak_var, show="●")
         self.coupang_ak_entry.pack(side="left", fill="x", expand=True)
-        _soft_btn(cak, "표시", self._toggle_coupang_ak).pack(
+        _soft_btn(cak_row, "표시", self._toggle_coupang_ak).pack(
             side="left", padx=(4, 0))
 
         r += 1
-        self._lbl(form, "쿠팡 Secret Key:", r)
         csk = tk.Frame(form, bg=BG_CARD)
-        csk.grid(row=r, column=1, sticky="ew", pady=8)
+        csk.grid(row=r, column=0, columnspan=2, sticky="ew", pady=8)
+        csk.columnconfigure(0, weight=1)
+        tk.Label(csk, text="Secret Key 등록", font=F_SM, bg=BG_CARD,
+                 fg=FG_LABEL, anchor="w").pack(fill="x")
+        csk_row = tk.Frame(csk, bg=BG_CARD)
+        csk_row.pack(fill="x")
         self.coupang_sk_var = tk.StringVar()
         self.coupang_sk_var.trace_add("write", lambda *_: self._auto_save_api_keys())
-        self.coupang_sk_entry = _entry(csk, self.coupang_sk_var, show="●")
+        self.coupang_sk_entry = _entry(csk_row, self.coupang_sk_var, show="●")
         self.coupang_sk_entry.pack(side="left", fill="x", expand=True)
-        _soft_btn(csk, "표시", self._toggle_coupang_sk).pack(
+        _soft_btn(csk_row, "표시", self._toggle_coupang_sk).pack(
             side="left", padx=(4, 0))
 
         r += 1; _grid_sep(form, r)
@@ -1595,7 +1656,7 @@ class App:
                  bg=BG_CARD, fg=FG_LABEL, anchor="w").pack(fill="x", padx=12, pady=(0, 8))
 
     def _blog_log(self, msg):
-        if "[AGENT]" in msg or "[BLOG]" in msg or "[CAFE]" in msg or "[에이전트]" in msg:
+        if "[BLOG]" in msg or "[CAFE]" in msg or "[실행시작]" in msg:
             self.append_log_global(msg)
         def _do():
             t = self.blog_log_text
@@ -1682,35 +1743,55 @@ class App:
         self.append_log_global("[BLOG] run_blog_job ENTER")
         self._blog_posting_worker(keywords, gemini_key, accounts)
 
-    def _on_start_blog_posting(self, skip_confirm=False, cmd_id=None, program_username=None):
-        """skip_confirm=True: 자동재시작 시 저장 확인 메시지 없이 진행. cmd_id/program_username: 에이전트 완료 처리용"""
+    def _on_start_blog_posting(self, skip_confirm=False, cmd_id=None, program_username=None, task_keywords_override=None):
+        """skip_confirm=True: 자동재시작 시 저장 확인 메시지 없이 진행. cmd_id/program_username: (레거시, 미사용).
+        task_keywords_override: post_tasks에서 온 키워드 리스트 (통신시작 모드)."""
         self.worker_thread = None
         self._last_start_error = None
         if not self._require_login_and_session("blog"):
             self._last_start_error = "로그인/세션 필요"
             return
-        if self._agent_exec_var.get():
-            self._agent_apply_config()
-        use_paid = getattr(self, "use_paid_member_keywords_var", None) and self.use_paid_member_keywords_var.get()
-        if use_paid and self._is_admin():
+        is_task_run = bool(task_keywords_override and getattr(self, "_comm_current_task_id", None))
+        if not is_task_run:
             try:
-                from supabase_client import fetch_paid_member_keywords_pool
-                post_count = max(2, self.blog_post_count_var.get())
-                keywords = fetch_paid_member_keywords_pool(count=post_count * 2, log=self._blog_log)
-                if not keywords:
-                    self._last_start_error = "유료회원 키워드 없음"
-                    messagebox.showwarning("안내", "유료회원 키워드가 없습니다. Supabase paid_members 테이블을 확인하세요.")
+                from auth import get_session
+                from shared.gui_data import fetch_user_coupang_keys
+                s = get_session()
+                uid = (s or {}).get("id")
+                keys = fetch_user_coupang_keys(username=(s or {}).get("username"), user_id=uid, log=self._blog_log)
+                if not keys and not (getattr(self, "coupang_ak_var", None) and self.coupang_ak_var.get().strip() and getattr(self, "coupang_sk_var", None) and self.coupang_sk_var.get().strip()):
+                    messagebox.showwarning("안내", "쿠팡파트너스 키를 등록후 진행하세요.")
                     return
-            except Exception as e:
-                self._last_start_error = f"유료회원 키워드 조회 실패: {e}"
-                messagebox.showerror("오류", f"유료회원 키워드 조회 실패:\n{e}")
+            except Exception:
+                if not (getattr(self, "coupang_ak_var", None) and self.coupang_ak_var.get().strip() and getattr(self, "coupang_sk_var", None) and self.coupang_sk_var.get().strip()):
+                    messagebox.showwarning("안내", "쿠팡파트너스 키를 등록후 진행하세요.")
+                    return
+        if task_keywords_override is not None:
+            keywords = list(task_keywords_override) if task_keywords_override else []
+            if not keywords:
+                self._last_start_error = "task 키워드 없음"
                 return
         else:
-            keywords = [k for k in (self.keywords or []) if k and str(k).strip()]
-            if not keywords:
-                self._last_start_error = "키워드 없음"
-                messagebox.showwarning("안내", "키워드를 먼저 '상품 검색' 탭에서 불러오세요.")
-                return
+            use_paid = getattr(self, "use_paid_member_keywords_var", None) and self.use_paid_member_keywords_var.get()
+            if use_paid and self._is_admin():
+                try:
+                    from shared.gui_data import fetch_paid_member_keywords_pool
+                    post_count = max(2, self.blog_post_count_var.get())
+                    keywords = fetch_paid_member_keywords_pool(count=post_count * 2, log=self._blog_log)
+                    if not keywords:
+                        self._last_start_error = "유료회원 키워드 없음"
+                        messagebox.showwarning("안내", "유료회원 키워드가 없습니다. Supabase paid_members 테이블을 확인하세요.")
+                        return
+                except Exception as e:
+                    self._last_start_error = f"유료회원 키워드 조회 실패: {e}"
+                    messagebox.showerror("오류", f"유료회원 키워드 조회 실패:\n{e}")
+                    return
+            else:
+                keywords = [k for k in (self.keywords or []) if k and str(k).strip()]
+                if not keywords:
+                    self._last_start_error = "키워드 없음"
+                    messagebox.showwarning("안내", "키워드를 먼저 '상품 검색' 탭에서 불러오세요.")
+                    return
         multi = getattr(self, "blog_multi_account_var", None) and self.blog_multi_account_var.get()
         if multi:
             path = getattr(self, "blog_multi_account_file_var", None) and self.blog_multi_account_file_var.get().strip()
@@ -1751,15 +1832,21 @@ class App:
         if not use_paid:
             keywords = [k for k in (self.keywords or []) if k and str(k).strip()]
         random.shuffle(keywords)
+        blog_task_user_id = getattr(self, "_comm_current_user_id", None) if task_keywords_override else None
         self.worker_thread = threading.Thread(
             target=self.run_blog_job,
             args=(keywords, gk, accounts),
+            kwargs={"task_user_id": blog_task_user_id},
             daemon=True
         )
         self.worker_thread.start()
-        self.append_log_global("[AGENT] blog worker thread started")
 
-    def _blog_posting_worker(self, keywords, gemini_key, accounts):
+    def run_blog_job(self, keywords, gemini_key, accounts, task_user_id=None):
+        """블로그 포스팅 실제 작업 (백그라운드 스레드에서 호출). task_user_id: post_tasks 태스크 소유자."""
+        self.append_log_global("[BLOG] run_blog_job ENTER")
+        self._blog_posting_worker(keywords, gemini_key, accounts, task_user_id=task_user_id)
+
+    def _blog_posting_worker(self, keywords, gemini_key, accounts, task_user_id=None):
         """accounts: [{"id", "pw"}, ...] — 다중아이디 시 여러 계정, 단일 시 1개"""
         self._blog_log("[BLOG] worker started")
         import time
@@ -1774,7 +1861,7 @@ class App:
 
             paid_members = []
             try:
-                from supabase_client import fetch_paid_members
+                from shared.gui_data import fetch_paid_members
                 self._blog_log("[Supabase] 유료회원 목록 조회 중...")
                 paid_members = fetch_paid_members(log=self._blog_log)
             except ImportError:
@@ -1787,17 +1874,28 @@ class App:
             coupang_ak, coupang_sk = None, None
             try:
                 from auth import get_session
-                from supabase_client import fetch_referrer, fetch_user_coupang_keys
+                from shared.gui_data import fetch_referrer, fetch_user_coupang_keys
                 s = get_session()
                 program_username = (s or {}).get("username", "") or ""
                 rid = (s or {}).get("referrer_id") if s else None
                 if rid:
                     self._blog_log(f"[Supabase] 추천인 '{rid}' 조회 중...")
                     referrer = fetch_referrer(rid, log=self._blog_log)
-                # 본인글용 쿠팡 API 키: users 테이블 우선 (SaaS에서 설정)
-                keys = fetch_user_coupang_keys(program_username, log=self._blog_log)
-                if keys:
+                # 쿠팡 API 키: task_user_id 있으면 태스크 소유자(profiles)만 사용(fallback 없음). 없으면 세션+GUI.
+                if (task_user_id or "").strip():
+                    keys = fetch_user_coupang_keys(user_id=(task_user_id or "").strip(), log=self._blog_log)
+                    if not keys:
+                        self._blog_log("[통신] 태스크 소유자 쿠팡키 미등록 — 작업 스킵")
+                        return
                     coupang_ak, coupang_sk = keys[0], keys[1]
+                else:
+                    coupang_uid = (s or {}).get("id")
+                    keys = fetch_user_coupang_keys(username=program_username, user_id=coupang_uid, log=self._blog_log)
+                    if keys:
+                        coupang_ak, coupang_sk = keys[0], keys[1]
+                    else:
+                        coupang_ak = self.coupang_ak_var.get().strip() or None
+                        coupang_sk = self.coupang_sk_var.get().strip() or None
             except Exception as e:
                 self._blog_log(f"[Supabase] 조회 실패: {e}")
             if not coupang_ak or not coupang_sk:
@@ -2285,19 +2383,6 @@ class App:
         self.helper_new_cafe_label = tk.Label(inner, text="", font=F_SM, bg=BG_CARD, fg=RED, anchor="w")
         self.helper_new_cafe_label.pack(fill="x", pady=(12, 8))
 
-        _sep(inner)
-
-        # 에이전트 모드 (SaaS 비서 모드)
-        self._sec(inner, "에이전트 모드 (비서 모드)")
-        agent_row = tk.Frame(inner, bg=BG_CARD)
-        agent_row.pack(fill="x", pady=(0, 4))
-        self.agent_mode_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(
-            agent_row, text="  Supabase tasks 테이블 1분마다 확인 — '대기' 작업 자동 실행",
-            variable=self.agent_mode_var, font=F_SM, bg=BG_CARD, fg=FG,
-            activebackground=BG_CARD, activeforeground=FG, selectcolor=BG_CARD,
-            command=self._on_agent_mode_toggle,
-        ).pack(side="left")
         _sep(inner)
 
         # 포스팅 진행
@@ -2927,11 +3012,11 @@ class App:
         def _do():
             try:
                 from auth import get_session
-                from supabase_client import fetch_helper_cafes, fetch_agent_cafe_lists
+                from shared.gui_data import fetch_helper_cafes, fetch_program_cafe_lists
                 s = get_session()
                 un = (s or {}).get("username", "").strip() if s else ""
                 if un:
-                    cafes = fetch_agent_cafe_lists(un, statuses=["saved", "joined"])
+                    cafes = fetch_program_cafe_lists(un, statuses=["saved", "joined"])
                     if not cafes:
                         cafes = fetch_helper_cafes()
                 else:
@@ -3035,6 +3120,7 @@ class App:
             "cafe_multi_account_file": self.cafe_multi_account_file_var.get() if hasattr(self, "cafe_multi_account_file_var") else "",
             "cafe_account_switch_wait": self.cafe_account_switch_wait_var.get() if hasattr(self, "cafe_account_switch_wait_var") else 5,
             "cafe_infinite_loop": self.cafe_infinite_loop_var.get() if hasattr(self, "cafe_infinite_loop_var") else False,
+            "last_cafe_idx": getattr(self, "_last_cafe_idx", 0),
         }
         with open(CAFE_SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -3045,6 +3131,7 @@ class App:
         self._cafe_log("[설정] 카페 설정 불러오기 완료")
 
     def _load_cafe_settings_silent(self):
+        self._last_cafe_idx = 0
         if not os.path.exists(CAFE_SETTINGS_FILE):
             dp = os.path.join(BASE_DIR, "cafe_list.txt")
             if os.path.exists(dp):
@@ -3100,6 +3187,7 @@ class App:
                 self.cafe_multi_account_file_var.set(data.get("cafe_multi_account_file", ""))
                 self.cafe_account_switch_wait_var.set(int(data.get("cafe_account_switch_wait", 5)))
                 self.cafe_infinite_loop_var.set(bool(data.get("cafe_infinite_loop", False)))
+            self._last_cafe_idx = max(0, int(data.get("last_cafe_idx", 0)))
             saved = data.get("cafe_list", [])
             if saved:
                 self.cafe_list = saved
@@ -3160,13 +3248,162 @@ class App:
                     err_msg = sid if isinstance(sid, str) and sid else "세션 등록 실패. 다시 시도해주세요."
                     messagebox.showwarning("안내", f"세션 등록 실패.\n{err_msg}")
                     return False
-                self._auth_session_id = sid
+                if sid:
+                    self._auth_session_id = sid
                 save_coupang_keys(user_id, ak, sk, log=self._log)
             return True
         except Exception as e:
             self._log(f"[인증] 오류: {e}")
             messagebox.showwarning("안내", "로그인 확인 중 오류가 발생했습니다. 다시 시도해주세요.")
             return False
+
+    def _save_gui_vm_config(self):
+        """VM 이름을 configs/gui_vm.json에 저장"""
+        try:
+            vm = (getattr(self, "_comm_vm_name_var", None) and self._comm_vm_name_var.get() or "").strip()
+            d = os.path.dirname(GUI_VM_CONFIG)
+            if d and not os.path.isdir(d):
+                os.makedirs(d, exist_ok=True)
+            with open(GUI_VM_CONFIG, "w", encoding="utf-8") as f:
+                json.dump({"VM_NAME": vm}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _on_comm_toggle(self):
+        """통신시작 체크박스 토글: 체크 시 post_tasks 폴링 시작, 해제 시 중지"""
+        if not getattr(self, "_comm_enabled_var", None):
+            return
+        if self._comm_enabled_var.get():
+            if not self._require_login_and_session():
+                self._comm_enabled_var.set(False)
+                return
+            self._comm_stop_flag = False
+            if not getattr(self, "_comm_poll_thread", None) or not self._comm_poll_thread.is_alive():
+                self._comm_poll_thread = threading.Thread(target=self._comm_poll_loop, daemon=True)
+                self._comm_poll_thread.start()
+            self._log("[통신] Supabase post_tasks 폴링 시작")
+            self.append_log_global("[통신] Supabase와 통신 시작 — 새 키워드 등록 시 자동 글 작성")
+        else:
+            self._comm_stop_flag = True
+            self._log("[통신] 폴링 중지")
+            self.append_log_global("[통신] 통신 중지")
+
+    def _comm_poll_loop(self):
+        """post_tasks 폴링 루프: pending 작업 발견 시 claim → 카페 포스팅 → finish"""
+        import time
+        POLL_INTERVAL = 15
+        while getattr(self, "_comm_enabled_var", None) and self._comm_enabled_var.get() and not getattr(self, "_comm_stop_flag", True):
+            try:
+                from shared.gui_data import fetch_pending_post_tasks, claim_post_task_for_gui, finish_post_task_for_gui
+                # 로그인과 무관하게 post_tasks의 모든 pending 작업 처리
+                tasks = fetch_pending_post_tasks(user_id=None, limit=1, log=self._log)
+                if not tasks:
+                    time.sleep(POLL_INTERVAL)
+                    continue
+                task = tasks[0]
+                task_id = task.get("id")
+                task_user_id = task.get("user_id")
+                kw = (task.get("keyword") or "").strip()
+                channel = (task.get("channel") or "cafe").strip().lower()
+                if not task_id:
+                    time.sleep(POLL_INTERVAL)
+                    continue
+                vm_name = (getattr(self, "_comm_vm_name_var", None) and self._comm_vm_name_var.get() or "").strip() or _load_gui_vm_config().get("VM_NAME", "")
+                if not claim_post_task_for_gui(task_id, task_user_id, vm_name=vm_name or None, log=self._log):
+                    time.sleep(POLL_INTERVAL)
+                    continue
+                self._log(f"[통신] task {task_id} 선점 — 키워드: {kw!r}" + (f" (VM: {vm_name})" if vm_name else ""))
+                self.append_log_global(f"[통신] 새 작업 발견 — 키워드 '{kw}'로 글 작성 시작")
+                self.root.after(0, lambda: self._run_task_posting(task_id, task_user_id, kw, channel))
+                time.sleep(3)
+                if not getattr(self, "is_posting", False):
+                    finish_post_task_for_gui(task_id, task_user_id, success=False, log=self._log)
+                    self._log(f"[통신] task {task_id} — 포스팅 시작 실패 (카페/계정 설정 확인)")
+                    time.sleep(POLL_INTERVAL)
+                    continue
+                while getattr(self, "is_posting", False) and not getattr(self, "_comm_stop_flag", True):
+                    time.sleep(2)
+                # 글작성 직후 이미 완료 등록했으면 성공 유지 (크롬 중간 종료 시 실패로 덮어쓰지 않음)
+                already_success = getattr(self, "_comm_task_finished_success", False)
+                success = already_success or (not getattr(self, "_posting_stop_flag", True))
+                published_url = getattr(self, "_comm_last_published_url", None)
+                if published_url:
+                    self._log(f"[통신] task {task_id} published_url 저장: {published_url[:50]}...")
+                else:
+                    self._log(f"[통신] task {task_id} published_url 없음 (success={success})")
+                if not already_success:
+                    finish_post_task_for_gui(task_id, task_user_id, success=success, published_url=published_url, log=self._log)
+                self._log(f"[통신] task {task_id} 완료 처리 (success={success})")
+                # 대기시간 설정만큼 대기 후 다음 폴링
+                imin = max(1, getattr(self, "cafe_interval_min_var", None) and self.cafe_interval_min_var.get() or 5)
+                imax = max(imin, getattr(self, "cafe_interval_max_var", None) and self.cafe_interval_max_var.get() or 30)
+                wait_min = random.randint(imin, imax)
+                self._log(f"[통신] 다음 작업까지 {wait_min}분 대기...")
+                self._cafe_log(f"[통신] {wait_min}분간 통신대기중")
+                for _ in range(wait_min * 60):
+                    if getattr(self, "_comm_stop_flag", True):
+                        break
+                    time.sleep(1)
+            except Exception as e:
+                self._log(f"[통신] 폴링 오류: {e}")
+            time.sleep(POLL_INTERVAL)
+
+    def _run_task_posting(self, task_id, user_id, kw, channel):
+        """task 키워드로 포스팅 시작 (메인 스레드에서 호출)"""
+        if not kw:
+            self._log("[통신] 키워드 없음 — task 스킵")
+            return
+        self._comm_current_task_id = task_id
+        self._comm_current_user_id = user_id
+        self._comm_last_published_url = None  # 이전 작업 URL 초기화
+        self._comm_task_finished_success = False  # 글작성 성공 시 즉시 완료 처리 여부
+        if channel == "blog":
+            self._switch_tab_main("blog")
+            self._on_start_blog_posting(skip_confirm=True, task_keywords_override=[kw])
+        else:
+            self._switch_tab_main("cafe")
+            self._on_start_posting(skip_confirm=True, task_keywords_override=[kw])
+
+    def _on_enqueue_start(self):
+        """실행 시작: enqueue_post_tasks_paid RPC 호출 → post_tasks에 pending 작업 생성"""
+        if not self._require_login_and_session():
+            return
+        try:
+            from shared.gui_data import enqueue_post_tasks_paid, fetch_user_coupang_keys
+            user_id = getattr(self, "current_user_id", None)
+            if not user_id:
+                from auth import get_session
+                s = get_session()
+                user_id = s.get("id") if s else None
+            if not user_id:
+                messagebox.showwarning("안내", "세션 정보가 없습니다. 다시 로그인해주세요.")
+                return
+            keys = fetch_user_coupang_keys(user_id=user_id, log=self._log)
+            if not keys:
+                messagebox.showwarning("안내", "쿠팡파트너스 키를 등록후 진행하세요.")
+                return
+            count = max(1, getattr(self, "blog_post_count_var", None) and self.blog_post_count_var.get() or 10)
+            channel = "cafe"  # 기본값
+            cur_tab = getattr(self, "_cur_tab", None) or "search"
+            if cur_tab == "blog":
+                channel = "blog"
+                count = max(1, getattr(self, "blog_post_count_var", None) and self.blog_post_count_var.get() or 10)
+            elif cur_tab == "cafe":
+                channel = "cafe"
+                count = max(2, getattr(self, "cafe_post_count_var", None) and self.cafe_post_count_var.get() or 10)
+            payload = {"meta": {}}
+            ok, data, err = enqueue_post_tasks_paid(user_id=user_id, channel=channel, count=count, cost=None, payload=payload, log=self._log)
+            if ok:
+                self._log(f"[실행시작] post_tasks enqueue 성공: channel={channel}, count={count}")
+                self.append_log_global(f"[실행시작] post_tasks enqueue 성공 — worker가 claim하여 실행합니다.")
+            else:
+                self._log(f"[실행시작] enqueue 실패: {err}")
+                self.append_log_global(f"[실행시작] enqueue 실패: {err}")
+                messagebox.showerror("오류", f"enqueue_post_tasks_paid 실패:\n{err}")
+        except Exception as e:
+            self._log(f"[실행시작] 오류: {e}")
+            self.append_log_global(f"[실행시작] 오류: {e}")
+            messagebox.showerror("오류", str(e))
 
     def _on_run_selected(self):
         if not self._require_login_and_session():
@@ -3219,7 +3456,7 @@ class App:
         banned_brands = []
         is_keyword_banned_fn = None
         try:
-            from supabase_client import fetch_banned_brands, is_keyword_banned
+            from shared.gui_data import fetch_banned_brands, is_keyword_banned
             banned_brands = fetch_banned_brands(log=self._log)
             is_keyword_banned_fn = is_keyword_banned
         except Exception as e:
@@ -3278,30 +3515,36 @@ class App:
     # ──────────────────────────────────────────────
     # CAFE POSTING
     # ──────────────────────────────────────────────
-    def _on_start_posting(self, skip_confirm=False, cafes_override=None, use_agent_cafe_loop=False):
+    def _on_start_posting(self, skip_confirm=False, cafes_override=None, use_agent_cafe_loop=False, task_keywords_override=None):
         """skip_confirm: 자동재시작 등에서 확인 팝업 없이 바로 시작.
-        cafes_override: 에이전트 모드에서 agent_cafe_lists로 가져온 카페 리스트 (서버뉴카페 체크 시).
-        use_agent_cafe_loop: True면 모두 완료 후 처음 카페부터 반복."""
+        cafes_override: 서버에서 가져온 카페 리스트 (도우미 모두사용 + 서버뉴카페 시).
+        use_agent_cafe_loop: True면 모두 완료 후 처음 카페부터 반복.
+        task_keywords_override: post_tasks에서 온 키워드 리스트 (통신시작 모드)."""
         if not self._require_login_and_session("cafe"):
             return
-        use_paid_kw = getattr(self, "use_paid_member_keywords_var", None) and self.use_paid_member_keywords_var.get()
-        if use_paid_kw and self._is_admin():
-            try:
-                from supabase_client import fetch_paid_member_keywords_pool
-                pc = max(2, self.cafe_post_count_var.get())
-                keywords_for_posting = fetch_paid_member_keywords_pool(count=pc * 2, log=self._cafe_log)
-                if not keywords_for_posting:
-                    messagebox.showwarning("안내", "유료회원 키워드가 없습니다. Supabase paid_members 테이블을 확인하세요.")
-                    return
-            except Exception as e:
-                messagebox.showerror("오류", f"유료회원 키워드 조회 실패:\n{e}")
+        if task_keywords_override is not None:
+            keywords_for_posting = [k for k in (task_keywords_override or []) if k and str(k).strip()]
+            if not keywords_for_posting:
                 return
         else:
-            if not self.keywords:
-                messagebox.showwarning("안내",
-                    "키워드를 먼저 '상품 검색' 탭에서 불러오세요.")
-                return
-            keywords_for_posting = None
+            use_paid_kw = getattr(self, "use_paid_member_keywords_var", None) and self.use_paid_member_keywords_var.get()
+            if use_paid_kw and self._is_admin():
+                try:
+                    from shared.gui_data import fetch_paid_member_keywords_pool
+                    pc = max(2, self.cafe_post_count_var.get())
+                    keywords_for_posting = fetch_paid_member_keywords_pool(count=pc * 2, log=self._cafe_log)
+                    if not keywords_for_posting:
+                        messagebox.showwarning("안내", "유료회원 키워드가 없습니다. Supabase paid_members 테이블을 확인하세요.")
+                        return
+                except Exception as e:
+                    messagebox.showerror("오류", f"유료회원 키워드 조회 실패:\n{e}")
+                    return
+            else:
+                if not self.keywords:
+                    messagebox.showwarning("안내",
+                        "키워드를 먼저 '상품 검색' 탭에서 불러오세요.")
+                    return
+                keywords_for_posting = None
         multi = getattr(self, "cafe_multi_account_var", None) and self.cafe_multi_account_var.get()
         if multi:
             path = getattr(self, "cafe_multi_account_file_var", None) and self.cafe_multi_account_file_var.get().strip()
@@ -3324,7 +3567,10 @@ class App:
             messagebox.showwarning("안내",
                 "Gemini API Key를 먼저 '상품 검색' 탭에서 입력하세요.")
             return
-        if cafes_override is not None:
+        comm_mode_agent_cafe = bool(task_keywords_override and getattr(self, "_comm_current_task_id", None))
+        if comm_mode_agent_cafe:
+            cafes_for_posting = []
+        elif cafes_override is not None:
             cafes_for_posting = cafes_override
         else:
             mode = self.helper_cafe_mode_var.get()
@@ -3332,7 +3578,7 @@ class App:
                 cafes_for_posting = [{"cafe_id": c["cafe_id"], "menu_id": c["menu_id"]} for c in getattr(self, "helper_cafes", [])]
             else:
                 cafes_for_posting = self.cafe_list
-        if not cafes_for_posting:
+        if not comm_mode_agent_cafe and not cafes_for_posting:
             if cafes_override is not None:
                 msg = "서버에 가입된 카페(agent_cafe_lists)가 없습니다. 카페가입을 먼저 진행해주세요."
             else:
@@ -3340,6 +3586,21 @@ class App:
                 msg = "카페리스트를 먼저 불러오세요." if mode != "all" else "서버 도우미 카페리스트가 비어있습니다. '적용' 버튼을 눌러주세요."
             messagebox.showwarning("안내", msg)
             return
+        is_task_run = bool(task_keywords_override and getattr(self, "_comm_current_task_id", None))
+        if not is_task_run:
+            try:
+                from auth import get_session
+                from shared.gui_data import fetch_user_coupang_keys
+                s = get_session()
+                uid = (s or {}).get("id")
+                keys = fetch_user_coupang_keys(username=(s or {}).get("username"), user_id=uid, log=self._cafe_log)
+                if not keys and not (self.coupang_ak_var.get().strip() and self.coupang_sk_var.get().strip()):
+                    messagebox.showwarning("안내", "쿠팡파트너스 키를 등록후 진행하세요.")
+                    return
+            except Exception:
+                if not (self.coupang_ak_var.get().strip() and self.coupang_sk_var.get().strip()):
+                    messagebox.showwarning("안내", "쿠팡파트너스 키를 등록후 진행하세요.")
+                    return
         if self.is_posting:
             messagebox.showinfo("안내", "이미 포스팅이 진행 중입니다.")
             return
@@ -3359,97 +3620,206 @@ class App:
         self._clear_cafe_log()
         self._update_cafe_progress(0, "준비 중...")
         self._save_cafe_settings()
-        self.append_log_global("[AGENT] starting thread -> _posting_worker()")
+        comm_task_id = getattr(self, "_comm_current_task_id", None) if keywords_for_posting else None
+        comm_task_user_id = getattr(self, "_comm_current_user_id", None) if comm_task_id else None
         t = threading.Thread(
             target=self._posting_worker,
             args=(cafes_for_posting, accounts),
-            kwargs={"keywords_override": keywords_for_posting, "use_agent_cafe_loop": use_agent_cafe_loop},
+            kwargs={
+                "keywords_override": keywords_for_posting,
+                "use_agent_cafe_loop": use_agent_cafe_loop,
+                "task_id": comm_task_id,
+                "task_user_id": comm_task_user_id,
+                "comm_mode_agent_cafe": comm_mode_agent_cafe,
+            },
             daemon=True,
         )
         t.start()
-        self.append_log_global("[AGENT] cafe worker thread started")
 
     def _on_stop_posting(self):
+        # 포스팅 중이면 worker 중지 플래그
         if self.is_posting:
             self._posting_stop_flag = True
-            self._cafe_log(
-                "[중지] 포스팅 중지 요청됨 — 크롬 브라우저를 종료합니다...")
-            from cafe_poster import safe_quit_driver
-            d = (self._driver_holder.get("driver")
-                 if hasattr(self, '_driver_holder') else None)
-            if d:
-                safe_quit_driver(d)
-                self._driver_holder["driver"] = None
-                self._cafe_log("[중지] ✔ 크롬 브라우저 강제 종료 완료")
+        # 통신대기중이면 폴링 루프의 대기 즉시 중단
+        if getattr(self, "_comm_enabled_var", None) and self._comm_enabled_var.get():
+            self._comm_stop_flag = True
+        self._cafe_log("[중지] 포스팅 중지 요청됨 — 크롬 브라우저를 종료합니다...")
+        from cafe_poster import safe_quit_driver
+        d = None
+        if hasattr(self, "_driver_holder") and isinstance(getattr(self, "_driver_holder"), dict):
+            d = self._driver_holder.get("driver")
+        if d:
+            safe_quit_driver(d)
+            self._driver_holder["driver"] = None
+            self._cafe_log("[중지] ✔ 크롬 브라우저 강제 종료 완료")
 
-    def _posting_worker(self, cafes_for_posting=None, accounts=None, task_id=None, keywords_override=None, use_agent_cafe_loop=False):
+    def _posting_worker(self, cafes_for_posting=None, accounts=None, task_id=None, task_user_id=None, keywords_override=None, use_agent_cafe_loop=False, comm_mode_agent_cafe=False):
         """accounts: [{"id", "pw"}, ...] — 다중아이디 시 여러 계정. keywords_override: 유료회원 키워드 사용 시.
-        use_agent_cafe_loop: True면 서버뉴카페 모드 — 모두 완료 후 처음 카페부터 반복."""
+        task_user_id: post_tasks 태스크 소유자 user_id — 이 값이 있으면 해당 사용자의 쿠팡키 사용 (프로그램 로그인 무관).
+        use_agent_cafe_loop: True면 서버뉴카페 모드 — 모두 완료 후 처음 카페부터 반복.
+        comm_mode_agent_cafe: True면 통신모드 — agent_cafe_lists만 naver_id 기준, 카페<50이면 가입 1개 후 글작성 1건."""
         self.append_log_global("[CAFE] worker started")
         self._cafe_log("[CAFE] worker started")
         import time
-        from cafe_poster import run_auto_posting
+        from cafe_poster import run_auto_posting, setup_driver, login_to_naver
         accounts = accounts or [{"id": self.naver_id_var.get().strip(), "pw": self.naver_pw_var.get().strip()}]
         keywords_to_use = (keywords_override if keywords_override is not None else self.keywords) or []
         gk = self.gemini_key_var.get().strip()
         sl = 1
         imd = self.img_dir_var.get().strip()
         posted = [0]
-        self._driver_holder = {"driver": None}
+        # 통신모드: 기존 크롬창 재사용. 일반모드: 매번 새로 시작
+        if task_id is None:
+            self._driver_holder = {"driver": None}
+        elif not hasattr(self, "_driver_holder") or self._driver_holder is None:
+            self._driver_holder = {"driver": None}
+
+        comm_naver_id = ""
+        comm_naver_pw = ""
+        driver_holder = self._driver_holder
+        if comm_mode_agent_cafe and task_id and accounts:
+            comm_naver_id = (accounts[0].get("id") or "").strip()
+            comm_naver_pw = (accounts[0].get("pw") or "").strip()
+            if not comm_naver_id or not comm_naver_pw:
+                self._cafe_log("[통신] 네이버 아이디/비밀번호 없음")
+                self.is_posting = False
+                return
+            driver = driver_holder.get("driver")
+            if not driver:
+                try:
+                    driver = setup_driver(headless=False)
+                    driver_holder["driver"] = driver
+                    if not login_to_naver(driver, comm_naver_id, comm_naver_pw, log=self._cafe_log):
+                        self._cafe_log("[통신] 네이버 로그인 실패")
+                        self.is_posting = False
+                        return
+                except Exception as e:
+                    self._cafe_log(f"[통신] 드라이버/로그인 오류: {e}")
+                    self.is_posting = False
+                    return
+
+        def _fetch_comm_cafes():
+            """comm_mode_agent_cafe용: agent_cafe_lists에서 카페 1개 선택 (가입 필요 시 1개 가입 후)."""
+            from supabase_client import delete_expired_agent_cafes, fetch_agent_cafe_lists_full
+            from config import OWNER_USER_ID
+            from shared.gui_data import get_admin_settings, fetch_cafe_join_policy
+            policy = fetch_cafe_join_policy(log=self._cafe_log) or {}
+            expire_days = int(policy.get("expire_days") or 10)
+            target_count = int(policy.get("target_count") or 50)
+            delete_expired_agent_cafes(comm_naver_id, days=expire_days, log=self._cafe_log)
+            cafes_full = fetch_agent_cafe_lists_full(comm_naver_id, statuses=["saved", "joined"], log=self._cafe_log)
+            if len(cafes_full) < target_count:
+                self._cafe_log(f"[통신] 카페 {len(cafes_full)}개 (목표 {target_count}) → 1개 가입 후 글작성")
+                try:
+                    from cafe_autojoin import run_cafe_join_job
+                    admin = get_admin_settings(log=self._cafe_log)
+                    captcha_key = (admin.get("captcha_api_key") or admin.get("captcha_key") or "").strip() or None
+                    if not captcha_key:
+                        self._cafe_log("[통신] app_links(captcha_api_key) 없음 — 캡챠 시 스킵됨")
+                    comm_vm_name = (getattr(self, "_comm_vm_name_var", None) and self._comm_vm_name_var.get() or "").strip() or _load_gui_vm_config().get("VM_NAME", "")
+                    # post_tasks의 assigned_vm_name처럼 agent_cafe_lists에도 vm_name 등록 (없으면 GUI로 식별)
+                    vm_for_cafe = (comm_vm_name or "GUI").strip()
+                    run_cafe_join_job(
+                        owner_user_id=OWNER_USER_ID,
+                        program_username=comm_naver_id,
+                        naver_id=comm_naver_id,
+                        naver_pw=comm_naver_pw,
+                        stop_flag=lambda: getattr(self, "_posting_stop_flag", False),
+                        log=self._cafe_log,
+                        immediate=True,
+                        target_count_override=1,
+                        driver_holder=driver_holder,
+                        captcha_api_key=captcha_key,
+                        vm_name=vm_for_cafe or None,
+                    )
+                except Exception as e:
+                    self._cafe_log(f"[통신] 카페가입 실패: {e}")
+                cafes_full = fetch_agent_cafe_lists_full(comm_naver_id, statuses=["saved", "joined"], log=self._cafe_log)
+            if not cafes_full:
+                return None
+            cafes_sorted = sorted(cafes_full, key=lambda c: (c.get("last_posted_at") or "1970-01-01"))
+            first_cafe = cafes_sorted[0]
+            return [{"cafe_id": first_cafe["cafe_id"], "menu_id": first_cafe["menu_id"], "_cafe_url": first_cafe.get("cafe_url", "")}]
+
         cafes = cafes_for_posting if cafes_for_posting is not None else self.cafe_list
         multi = getattr(self, "cafe_multi_account_var", None) and self.cafe_multi_account_var.get()
         infinite = getattr(self, "cafe_infinite_loop_var", None) and self.cafe_infinite_loop_var.get()
         wait_min = max(1, getattr(self, "cafe_account_switch_wait_var", None) and self.cafe_account_switch_wait_var.get() or 5)
 
-        # ── Supabase에서 유료회원 목록 가져오기 ──
+        # ── Supabase에서 유료회원 목록 가져오기 (통신모드 agent_cafe: 스킵) ──
         paid_members = []
-        try:
-            from supabase_client import fetch_paid_members
-            self._cafe_log("[Supabase] 유료회원 목록 조회 중...")
-            paid_members = fetch_paid_members(log=self._cafe_log)
-        except ImportError:
-            self._cafe_log("[Supabase] supabase 패키지 미설치 — 본인 글만 발행합니다.")
-        except Exception as e:
-            self._cafe_log(f"[Supabase] 조회 실패: {e} — 본인 글만 발행합니다.")
+        if not comm_mode_agent_cafe:
+            try:
+                from shared.gui_data import fetch_paid_members
+                self._cafe_log("[Supabase] 유료회원 목록 조회 중...")
+                paid_members = fetch_paid_members(log=self._cafe_log)
+            except ImportError:
+                self._cafe_log("[Supabase] supabase 패키지 미설치 — 본인 글만 발행합니다.")
+            except Exception as e:
+                self._cafe_log(f"[Supabase] 조회 실패: {e} — 본인 글만 발행합니다.")
 
-        # ── 추천인(referrer_id) 조회 (세션에 있으면) ──
+        # ── 추천인(referrer_id) 및 쿠팡 API 키 조회 ──
+        # post_tasks 태스크: task_user_id(태스크 소유자)의 쿠팡키 사용. 일반모드: 프로그램 로그인 사용자.
         referrer = None
         program_username = ""
         coupang_ak, coupang_sk = None, None
         try:
             from auth import get_session
-            from supabase_client import fetch_referrer, fetch_user_coupang_keys
+            from shared.gui_data import fetch_referrer, fetch_user_coupang_keys
             s = get_session()
             program_username = (s or {}).get("username", "") or ""
-            rid = (s or {}).get("referrer_id") if s else None
-            if rid:
-                self._cafe_log(f"[Supabase] 추천인 '{rid}' 조회 중...")
-                referrer = fetch_referrer(rid, log=self._cafe_log)
-            # 본인글용 쿠팡 API 키: users 테이블 우선 (SaaS에서 설정)
-            keys = fetch_user_coupang_keys(program_username, log=self._cafe_log)
-            if keys:
+            if not comm_mode_agent_cafe:
+                rid = (s or {}).get("referrer_id") if s else None
+                if rid:
+                    self._cafe_log(f"[Supabase] 추천인 '{rid}' 조회 중...")
+                    referrer = fetch_referrer(rid, log=self._cafe_log)
+            # 쿠팡 API 키: task_user_id 있으면 태스크 소유자(profiles)만 사용(fallback 없음). 없으면 세션+GUI.
+            if (task_user_id or "").strip():
+                keys = fetch_user_coupang_keys(user_id=(task_user_id or "").strip(), log=self._cafe_log)
+                if not keys:
+                    self._cafe_log("[통신] 태스크 소유자 쿠팡키 미등록 — 작업 스킵")
+                    self.is_posting = False
+                    try:
+                        from shared.gui_data import finish_post_task_for_gui
+                        self.root.after(0, lambda: finish_post_task_for_gui(task_id or "", task_user_id or "", success=False, log=self._cafe_log))
+                    except Exception:
+                        pass
+                    return
                 coupang_ak, coupang_sk = keys[0], keys[1]
+            else:
+                coupang_uid = (s or {}).get("id")
+                keys = fetch_user_coupang_keys(username=program_username, user_id=coupang_uid, log=self._cafe_log)
+                if keys:
+                    coupang_ak, coupang_sk = keys[0], keys[1]
+                else:
+                    coupang_ak = self.coupang_ak_var.get().strip() or None
+                    coupang_sk = self.coupang_sk_var.get().strip() or None
         except Exception as e:
             self._cafe_log(f"[Supabase] 추천인 조회 실패: {e}")
         if not coupang_ak or not coupang_sk:
             coupang_ak = self.coupang_ak_var.get().strip() or None
             coupang_sk = self.coupang_sk_var.get().strip() or None
 
-        # 교차 발행 시 total 재계산
-        if paid_members:
+        # 교차 발행 시 total 재계산 (통신모드 agent_cafe: 서버 키워드만, 유료/추천인 미사용)
+        if comm_mode_agent_cafe:
+            total = 1
+        elif paid_members:
             kw = max(len(keywords_to_use), 1)
             if referrer:
                 cycles = (kw + 2) // 3
                 task_count = cycles * 6
             else:
                 task_count = kw * 2
+            pc = max(2, self.cafe_post_count_var.get())
+            if pc and pc > 0 and task_count > pc:
+                task_count = pc
+            total = task_count
         else:
             task_count = len(keywords_to_use)
-        # post_count로 발행 개수 제한 적용 (최소 2: 본인글 포함)
-        pc = max(2, self.cafe_post_count_var.get())
-        if pc and pc > 0 and task_count > pc:
-            task_count = pc
-        total = task_count  # 카페당 키워드 1씩 → 총 포스팅 = 작업 수
+            pc = max(2, self.cafe_post_count_var.get())
+            if pc and pc > 0 and task_count > pc:
+                task_count = pc
+            total = task_count
 
         def log_prog(msg):
             self._cafe_log(msg)
@@ -3461,18 +3831,67 @@ class App:
 
         account_idx = 0
         result = {"success": 0, "fail": 0}
+        current_task_id = task_id
+        current_task_user_id = task_user_id
+        _comm_cycle_count = 0
         try:
             while True:
                 if getattr(self, "_posting_stop_flag", False):
                     self._cafe_log("[중지] 사용자가 작업을 중지했습니다.")
                     break
-                acc = accounts[account_idx]
-                nid, npw = acc["id"], acc["pw"]
+                # 통신모드 agent_cafe: 2회차부터 새 태스크 claim → 다른 키워드 사용
+                if comm_mode_agent_cafe:
+                    if _comm_cycle_count > 0:
+                        from shared.gui_data import fetch_pending_post_tasks, claim_post_task_for_gui, fetch_user_coupang_keys
+                        tasks = fetch_pending_post_tasks(user_id=None, limit=1, log=self._cafe_log)
+                        if not tasks:
+                            self._cafe_log("[통신] 추가 pending 태스크 없음 — 종료")
+                            break
+                        t = tasks[0]
+                        new_task_id = t.get("id")
+                        new_task_user_id = t.get("user_id")
+                        new_kw = (t.get("keyword") or "").strip()
+                        if not new_task_id or not new_kw:
+                            self._cafe_log("[통신] 태스크 키워드 없음 — 종료")
+                            break
+                        vm_name = (getattr(self, "_comm_vm_name_var", None) and self._comm_vm_name_var.get() or "").strip() or _load_gui_vm_config().get("VM_NAME", "")
+                        if not claim_post_task_for_gui(new_task_id, new_task_user_id, vm_name=vm_name or None, log=self._cafe_log):
+                            self._cafe_log("[통신] 태스크 선점 실패 — 종료")
+                            break
+                        current_task_id = new_task_id
+                        current_task_user_id = new_task_user_id
+                        keywords_to_use = [new_kw]
+                        keys = fetch_user_coupang_keys(user_id=new_task_user_id, log=self._cafe_log)
+                        if not keys:
+                            self._cafe_log("[통신] 새 태스크 소유자 쿠팡키 미등록 — 스킵")
+                            break
+                        coupang_ak, coupang_sk = keys[0], keys[1]
+                        self._cafe_log(f"[통신] 다음 태스크 선점 — 키워드: {new_kw!r}")
+                    _comm_cycle_count += 1
+                if comm_mode_agent_cafe:
+                    try:
+                        cafes = _fetch_comm_cafes()
+                        if not cafes:
+                            self._cafe_log("[통신] agent_cafe_lists에 카페 없음 — 스킵")
+                            break
+                    except Exception as e:
+                        self._cafe_log(f"[통신] agent_cafe_lists 조회 실패: {e}")
+                        break
+                    nid, npw = comm_naver_id, comm_naver_pw
+                else:
+                    acc = accounts[account_idx]
+                    nid, npw = acc["id"], acc["pw"]
                 if multi and len(accounts) > 1:
                     self._cafe_log(f"\n[다중아이디] {account_idx + 1}/{len(accounts)}번째 계정: {nid}")
+                comm_mode = task_id is not None
+                start_idx = getattr(self, "_last_cafe_idx", 0)
+                post_count_val = 1 if comm_mode_agent_cafe else max(2, self.cafe_post_count_var.get())
+                _paid = None if comm_mode_agent_cafe else (paid_members or None)
+                _referrer = None if comm_mode_agent_cafe else referrer
                 result = run_auto_posting(
                     login_id=nid, password=npw, cafes=cafes,
                     keywords=keywords_to_use, gemini_api_key=gk,
+                    start_cafe_idx=start_idx,
                     search_limit=sl, image_save_dir=imd, log=log_prog,
                     stop_flag=lambda: getattr(self, '_posting_stop_flag', False),
                     driver_holder=self._driver_holder,
@@ -3485,21 +3904,58 @@ class App:
                     link_btn_image=None,  # 더 이상 사용하지 않음 (댓글 방식)
                     coupang_access_key=coupang_ak,
                     coupang_secret_key=coupang_sk,
-                    paid_members=paid_members or None,
-                    referrer=referrer,
-                    post_count=max(2, self.cafe_post_count_var.get()),
+                    paid_members=_paid,
+                    referrer=_referrer,
+                    post_count=post_count_val,
                     use_product_name=self.cafe_use_product_name_var.get(),
                     category=self.selected_category.get(),
                     commission_image_folder=self.commission_image_folder_var.get().strip() or None,
-                    program_username=program_username)
+                    program_username=program_username,
+                    keep_driver_open=comm_mode,
+                    comm_mode=comm_mode)
+
+                if comm_mode_agent_cafe and cafes and len(cafes) > 0:
+                    cafe_url = cafes[0].get("_cafe_url", "")
+                    if cafe_url:
+                        try:
+                            from supabase_client import update_program_cafe_list_status, delete_agent_cafe_list
+                            from datetime import datetime, timezone
+                            sc = result.get("success", 0)
+                            fail_reason = result.get("last_cafe_fail_reason")
+                            if sc > 0:
+                                update_program_cafe_list_status(cafe_url, naver_id=nid, last_posted_at=datetime.now(timezone.utc).isoformat(), log=self._cafe_log)
+                                self._cafe_log("[통신] last_posted_at 갱신")
+                            elif fail_reason in ("member_required", "button_not_found"):
+                                delete_agent_cafe_list(cafe_url, naver_id=nid, log=self._cafe_log)
+                                self._cafe_log("[통신] 글작성 실패 — 카페 리스트에서 삭제")
+                        except Exception as e:
+                            self._cafe_log(f"[통신] agent_cafe_lists 갱신 실패: {e}")
+                    # 글작성 성공 시 즉시 post_tasks 완료 등록 (크롬 중간 종료해도 결과 보존)
+                    if current_task_id and result.get("success", 0) > 0 and result.get("published_url"):
+                        try:
+                            from shared.gui_data import finish_post_task_for_gui
+                            pub_url = result.get("published_url", "").strip()
+                            finish_post_task_for_gui(current_task_id, current_task_user_id, success=True, published_url=pub_url, log=self._cafe_log)
+                            self._comm_last_published_url = pub_url
+                            self._comm_task_finished_success = True
+                            self._cafe_log(f"[통신] 글작성 직후 작업완료 등록 (URL 저장): {pub_url[:50]}...")
+                        except Exception as e:
+                            self._cafe_log(f"[통신] 즉시 완료 등록 실패: {e}")
 
                 sc = result.get("success", 0)
                 fl = result.get("fail", 0)
+                next_idx = result.get("next_cafe_idx")
+                if next_idx is not None:
+                    self._last_cafe_idx = next_idx
+                    self._save_cafe_settings()
                 self._safe(self._update_cafe_progress, 100,
                            f"완료 — 성공: {sc} / 실패: {fl}")
 
                 if getattr(self, "_posting_stop_flag", False):
                     break
+                # 통신모드 agent_cafe: 1사이클 후 다음 사이클로 continue
+                if comm_mode_agent_cafe:
+                    continue
                 # 서버뉴카페 모드: 모두 완료 후 처음 카페부터 반복
                 if use_agent_cafe_loop:
                     self._cafe_log("\n[서버뉴카페] 처음 카페부터 재시작...")
@@ -3525,7 +3981,7 @@ class App:
                         time.sleep(1)
             self._safe(self._set_status, "done", f"포스팅 완료")
         except Exception as e:
-            self._cafe_log(f"[에이전트] 포스팅 실행 중 오류: {e}")
+            self._cafe_log(f"[포스팅] 실행 중 오류: {e}")
             result = {"success": 0, "fail": 0, "error": str(e)}
             self._safe(self._update_cafe_progress, 0, "오류 발생")
             self._safe(self._set_status, "error", str(e))
@@ -3533,527 +3989,15 @@ class App:
 
     def _on_posting_done(self, task_id=None, result=None):
         self.is_posting = False
-        # 에이전트 모드: tasks 테이블 업데이트
         if task_id and result is not None:
-            try:
-                from supabase_client import update_task_status
-                err = result.get("error")
-                if err:
-                    update_task_status(task_id, "failed", error_message=err, log=self._cafe_log)
-                    self._cafe_log(f"[에이전트] 작업 실패 → tasks 테이블 업데이트 (error: {err})")
-                elif result.get("success", 0) > 0:
-                    result_url = result.get("output_file") or f"성공 {result.get('success', 0)}건"
-                    update_task_status(task_id, "completed", result_url=result_url, log=self._cafe_log)
-                    self._cafe_log(f"[에이전트] 작업 완료 → tasks 테이블 업데이트 (result_url: {result_url})")
-                else:
-                    msg = f"성공 0건, 실패 {result.get('fail', 0)}건"
-                    update_task_status(task_id, "failed", error_message=msg, log=self._cafe_log)
-                    self._cafe_log(f"[에이전트] 작업 실패 → tasks 테이블 업데이트 ({msg})")
-            except Exception as e:
-                self._cafe_log(f"[에이전트] tasks 업데이트 실패: {e}")
+            pub = result.get("published_url")
+            # 이미 글작성 직후 저장한 URL이 있으면 None으로 덮어쓰지 않음
+            if pub or not getattr(self, "_comm_task_finished_success", False):
+                self._comm_last_published_url = pub
+        # task_id: 레거시(에이전트 모드 제거됨). post_tasks는 worker가 claim/finish 처리.
         # 자동재시작이 켜져 있으면 다음 지정 시간까지 타이머 예약
         if self._auto_restart_enabled:
             self._schedule_auto_restart()
-
-    def _on_agent_mode_toggle(self):
-        """에이전트 모드 체크박스 토글"""
-        if self.agent_mode_var.get():
-            if not self._require_login_and_session("cafe"):
-                self.agent_mode_var.set(False)
-                return
-            self._cafe_log("[에이전트] 비서 모드 활성화 — 1분마다 tasks 테이블 확인")
-            self._schedule_agent_poll()
-        else:
-            if self._agent_poll_timer_id:
-                self.root.after_cancel(self._agent_poll_timer_id)
-                self._agent_poll_timer_id = None
-            self._cafe_log("[에이전트] 비서 모드 비활성화")
-
-    def _schedule_agent_poll(self):
-        """1분(60초) 후에 에이전트 폴링 예약"""
-        if not getattr(self, "agent_mode_var", None) or not self.agent_mode_var.get():
-            return
-        if self._agent_poll_timer_id:
-            return
-        self._agent_poll_timer_id = self.root.after(60_000, self._agent_poll)
-
-    def _agent_poll(self):
-        """tasks 테이블에서 status='pending' 작업 확인 → 있으면 실행"""
-        self._agent_poll_timer_id = None
-        if not getattr(self, "agent_mode_var", None) or not self.agent_mode_var.get():
-            return
-        if self.is_posting:
-            self._schedule_agent_poll()
-            return
-        try:
-            from supabase_client import fetch_pending_task
-            task = fetch_pending_task(log=self._cafe_log)
-            if task:
-                self._cafe_log(f"[에이전트] 대기 작업 발견: keyword={task.get('keyword')}")
-                self.append_log_global("[AGENT] starting thread -> _agent_task_worker()")
-                t = threading.Thread(target=self._agent_task_worker, args=(task,), daemon=True)
-                t.start()
-                self.append_log_global(f"[AGENT] task thread started, is_alive={t.is_alive()}")
-                return
-        except Exception as e:
-            self._cafe_log(f"[에이전트] 폴링 오류: {e}")
-        self._schedule_agent_poll()
-
-    def _agent_task_worker(self, task):
-        """에이전트 모드: 단일 작업 실행 (run_pipeline + 포스팅)"""
-        self.append_log_global("[AGENT] _agent_task_worker started")
-        task_id = task.get("id")
-        keyword = (task.get("keyword") or "").strip()
-        if not keyword:
-            self._cafe_log("[에이전트] keyword 비어있음 — 건너뜀")
-            self.root.after(0, self._schedule_agent_poll)
-            return
-        try:
-            from supabase_client import update_task_status
-            update_task_status(task_id, "processing", log=self._cafe_log)
-        except Exception as e:
-            self._cafe_log(f"[에이전트] status 업데이트 실패: {e}")
-        # 키워드 1개로 설정 후 포스팅 워커 실행
-        orig_keywords = self.keywords
-        self.keywords = [keyword]
-        mode = self.helper_cafe_mode_var.get()
-        cafes = [{"cafe_id": c["cafe_id"], "menu_id": c["menu_id"]} for c in getattr(self, "helper_cafes", [])] if mode == "all" else self.cafe_list
-        if not cafes:
-            self._cafe_log("[에이전트] 카페 리스트 없음 — 도우미 적용 또는 카페 등록 필요")
-            self.keywords = orig_keywords
-            try:
-                from supabase_client import update_task_status
-                update_task_status(task_id, "failed", error_message="카페 리스트 없음", log=self._cafe_log)
-            except Exception as e:
-                self._cafe_log(f"[에이전트] tasks 업데이트 실패: {e}")
-            self.root.after(0, self._schedule_agent_poll)
-            return
-        self._posting_worker(cafes_for_posting=cafes, task_id=task_id)
-        self.keywords = orig_keywords
-        self.root.after(0, self._schedule_agent_poll)
-
-    # ──────────────────────────────────────────────
-    # 에이전트모드 실행 (agent_commands + agent_configs)
-    # ──────────────────────────────────────────────
-    def _on_agent_exec_toggle(self):
-        if self._agent_exec_var.get():
-            try:
-                from auth import get_session
-                s = get_session()
-                if not s or not s.get("username"):
-                    self._agent_exec_var.set(False)
-                    messagebox.showwarning("안내", "에이전트 모드를 사용하려면 먼저 로그인하세요.")
-                    return
-            except Exception:
-                self._agent_exec_var.set(False)
-                return
-            self._cafe_log("[에이전트] 실행 모드 활성화 — agent_commands 45초마다 확인")
-            self._schedule_agent_cmd_poll()
-            self._schedule_agent_heartbeat()
-        else:
-            if self._agent_cmd_poll_timer_id:
-                self.root.after_cancel(self._agent_cmd_poll_timer_id)
-                self._agent_cmd_poll_timer_id = None
-            if self._agent_heartbeat_timer_id:
-                self.root.after_cancel(self._agent_heartbeat_timer_id)
-                self._agent_heartbeat_timer_id = None
-            self._cafe_log("[에이전트] 실행 모드 비활성화")
-
-    def _schedule_agent_cmd_poll(self):
-        if not self._agent_exec_var.get():
-            return
-        if self._agent_cmd_poll_timer_id:
-            return
-        self._agent_cmd_poll_timer_id = self.root.after(45_000, self._agent_cmd_poll)
-
-    def _schedule_agent_heartbeat(self):
-        if not self._agent_exec_var.get():
-            return
-        if self._agent_heartbeat_timer_id:
-            return
-        self._agent_heartbeat_timer_id = self.root.after(150_000, self._agent_heartbeat_tick)
-
-    def _agent_heartbeat_tick(self):
-        self._agent_heartbeat_timer_id = None
-        if not self._agent_exec_var.get():
-            return
-        try:
-            from auth import get_session
-            from supabase_client import agent_heartbeat
-            s = get_session()
-            if s and s.get("username"):
-                agent_heartbeat(s["username"], log=self._cafe_log)
-        except Exception:
-            pass
-        self._schedule_agent_heartbeat()
-
-    def _check_cafe_join_schedule(self, program_username):
-        """가입시작시간 도래 시 자동 카페가입 (해당 날짜 해당 시간에 프로그램 켜져 있으면).
-        해당 프로그램 아이디의 agent_config.cafe_join 정책 사용."""
-        try:
-            from auth import get_session
-            from supabase_client import fetch_cafe_join_policy_for_program
-            from cafe_autojoin import _resolve_run_days
-            s = get_session()
-            owner_id = (s or {}).get("id") if s else None
-            policy = fetch_cafe_join_policy_for_program(program_username, owner_user_id=owner_id, log=self._cafe_log)
-            run_days_raw = policy.get("run_days") or [4, 14, 24]
-            start_time_str = (policy.get("start_time") or "09:00").strip() or "09:00"
-            now = datetime.datetime.now()
-            today = now.day
-            year, month = now.year, now.month
-            run_days = _resolve_run_days(run_days_raw, year, month)
-            if today not in run_days:
-                return  # 오늘은 실행일 아님
-            try:
-                parts = start_time_str.split(":")
-                h = int(parts[0]) if parts else 9
-                m = int(parts[1]) if len(parts) > 1 else 0
-            except Exception:
-                h, m = 9, 0
-            if now.hour < h or (now.hour == h and now.minute < m):
-                return  # 가입시작시간 아직 안 됨
-            last_run_file = os.path.join(BASE_DIR, ".cafe_join_last_run.json")
-            try:
-                if os.path.exists(last_run_file):
-                    with open(last_run_file, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    if data.get("date") == now.strftime("%Y-%m-%d"):
-                        return  # 오늘 이미 실행됨 (재시도 시 .cafe_join_last_run.json 삭제)
-            except Exception:
-                pass
-            self._cafe_log(f"[에이전트] 가입시작시간 도래 ({start_time_str}) — 자동 카페가입 시작")
-            self.root.after(0, lambda: self._run_cafe_join_job_async(cmd_id=None, program_username=program_username, payload={}))
-        except Exception as e:
-            self._cafe_log(f"[에이전트] 카페가입 스케줄 확인 오류: {e}")
-
-    def _agent_cmd_poll(self):
-        self._agent_cmd_poll_timer_id = None
-        if not self._agent_exec_var.get():
-            return
-        try:
-            from auth import get_session
-            from supabase_client import fetch_pending_stop_commands, fetch_pending_agent_commands, mark_agent_command_done, insert_agent_run
-            s = get_session()
-            if not s or not s.get("username"):
-                self._schedule_agent_cmd_poll()
-                return
-            un = s["username"]
-
-            # (A) stop 우선 체크 — 있으면 즉시 처리 후 다음 루프로
-            stop_rows = fetch_pending_stop_commands(un, log=self._cafe_log)
-            if stop_rows:
-                self._stop_flag = True
-                self._blog_stop_flag = True
-                self._posting_stop_flag = True
-                self.append_log_global("[AGENT] STOP received -> stop_flag set")
-                insert_agent_run(un, "stopped", log=self._log)
-                for r in stop_rows:
-                    mark_agent_command_done(r.get("id"), log=self._log)
-                self._schedule_agent_cmd_poll()
-                return
-
-            # (B) 그 외 명령 FIFO 처리 (created_at ASC, limit 20, stop 제외)
-            rows = fetch_pending_agent_commands(un, limit=20, exclude_stop=True, log=self._cafe_log)
-            if rows:
-                is_busy = self.is_blog_posting or self.is_posting or self.is_running
-                if is_busy:
-                    self._cafe_log(f"[에이전트] 명령 {len(rows)}건 수신 — 작업 중, stop만 처리 (stop 없음)")
-                else:
-                    self._cafe_log(f"[에이전트] 명령 {len(rows)}건 수신 — FIFO 순서대로 처리")
-                threading.Thread(target=self._agent_cmd_worker, args=(un, rows, is_busy), daemon=True).start()
-                return
-
-            # (C) 명령 없을 때: 가입시작시간 도래 시 자동 카페가입
-            if not getattr(self, "is_blog_posting", False) and not getattr(self, "is_posting", False) and not getattr(self, "is_running", False):
-                self._check_cafe_join_schedule(un)
-        except Exception as e:
-            self._cafe_log(f"[에이전트] 폴링 오류: {e}")
-        self._schedule_agent_cmd_poll()
-
-    def _agent_cmd_worker(self, program_username, rows, is_busy=False):
-        """에이전트 명령 처리. is_busy=True면 stop만 즉시 처리, 나머지는 대기."""
-        import traceback
-        from supabase_client import mark_agent_command_done, insert_agent_run
-        i = 0
-        try:
-            while i < len(rows):
-                row = rows[i]
-                cmd_id = row.get("id")
-                cmd = row.get("command") or ""
-                payload = row.get("payload") or {}
-
-                # 작업 중일 때: stop만 처리 (A에서 이미 처리했으나 혹시 모를 fallback)
-                if is_busy:
-                    if cmd == "stop":
-                        self._stop_flag = True
-                        self._blog_stop_flag = True
-                        self._posting_stop_flag = True
-                        insert_agent_run(program_username, "stopped", log=self._log)
-                        self.append_log_global("[AGENT] STOP received -> stop_flag set")
-                        mark_agent_command_done(cmd_id, log=self._log)
-                    i += 1
-                    continue
-
-                if cmd == "apply_config":
-                    # 연속 apply_config 수집 — 마지막 1개만 실제 적용, 나머지는 done만
-                    batch = [row]
-                    j = i + 1
-                    while j < len(rows) and (rows[j].get("command") or "") == "apply_config":
-                        batch.append(rows[j])
-                        j += 1
-                    self.append_log_global("[AGENT] apply_config received -> loading agent_configs")
-                    def _apply_and_log():
-                        self._agent_apply_config()
-                        self.append_log_global("[AGENT] apply_config applied")
-                    self.root.after(0, _apply_and_log)
-                    for r in batch:
-                        mark_agent_command_done(r.get("id"), log=self._log)
-                    i = j
-                    continue
-
-                if cmd == "start":
-                    self._stop_flag = False
-                    self.is_running = True
-                    insert_agent_run(program_username, "started", log=self._log)
-                    raw_mode = (payload or {}).get("mode", "blog")
-                    if raw_mode is None:
-                        mode = "blog"
-                    elif raw_mode in (0, "0"):
-                        mode = "blog"
-                    elif raw_mode in (1, "1"):
-                        mode = "cafe"
-                    elif raw_mode in ("blog", "cafe", "cafe_join"):
-                        mode = raw_mode
-                    else:
-                        mode = "blog"
-                    self.append_log_global(f"[AGENT] start received mode={mode}")
-                    self._log(f"[에이전트] start 명령 처리 (mode: {raw_mode!r}->{mode})")
-                    pl = payload or {}
-                    self.root.after(0, lambda m=mode, cid=cmd_id, un=program_username, p=pl: self._agent_apply_config_then_start(m, cid, un, p))
-                elif cmd == "stop":
-                    self._stop_flag = True
-                    self._blog_stop_flag = True
-                    self._posting_stop_flag = True
-                    insert_agent_run(program_username, "stopped", log=self._log)
-                    self.append_log_global("[AGENT] STOP received -> stop_flag set")
-                    mark_agent_command_done(cmd_id, log=self._log)
-                elif cmd == "restart":
-                    self._stop_flag = True
-                    self.root.after(0, self._agent_restart_loop)
-                    mark_agent_command_done(cmd_id, log=self._log)
-                else:
-                    self.append_log_global(f"[AGENT] unknown command: {cmd!r}")
-                    self._log(f"[에이전트] 알 수 없는 명령: {cmd}")
-                    from supabase_client import mark_agent_command_error
-                    mark_agent_command_error(cmd_id, f"unknown command: {cmd!r}", log=self._log)
-                i += 1
-        except Exception as e:
-            self._log(f"[에이전트] 명령 처리 오류: {e}")
-            traceback.print_exc()
-            self.is_running = False
-            try:
-                insert_agent_run(program_username, "error", message=str(e), log=self._log)
-            except Exception:
-                pass
-            try:
-                if i < len(rows):
-                    mark_agent_command_done(rows[i].get("id"), error_message=str(e), log=self._log)
-            except Exception:
-                pass
-        self.root.after(0, self._schedule_agent_cmd_poll)
-
-    def _agent_apply_config(self):
-        """agent_configs에서 설정 읽어서 GUI에 적용"""
-        try:
-            from auth import get_session
-            from supabase_client import fetch_agent_config
-            s = get_session()
-            if not s or not s.get("username"):
-                return
-            row = fetch_agent_config(s["username"], owner_user_id=s.get("id"), log=self._log)
-            cfg = row.get("config") or {}
-            blog = cfg.get("blog") or {}
-            if blog and hasattr(self, "blog_naver_id_var"):
-                self.blog_naver_id_var.set(blog.get("naver_id", ""))
-                self.blog_naver_pw_var.set(blog.get("naver_pw", ""))
-                self.blog_post_count_var.set(int(blog.get("publish_count", 10)))
-                self.blog_interval_min_var.set(int(blog.get("delay_min", 2)))
-                self.blog_interval_max_var.set(int(blog.get("delay_max", 5)))
-                ar = blog.get("auto_restart") or {}
-                if isinstance(ar, dict):
-                    self._auto_restart_enabled = bool(ar.get("enabled", False))
-                    self._auto_restart_blog = self._auto_restart_enabled
-                self.blog_auto_start_cafe_var.set(bool(blog.get("auto_start_cafe_after_blog", False)))
-            # 카페 설정 적용
-            cafe = cfg.get("cafe") or {}
-            if cafe and hasattr(self, "naver_id_var"):
-                self.naver_id_var.set(cafe.get("naver_id", ""))
-                self.naver_pw_var.set(cafe.get("naver_pw", ""))
-                self.cafe_post_count_var.set(max(2, int(cafe.get("publish_count", 10))))
-                self.cafe_interval_min_var.set(max(1, int(cafe.get("delay_min", 5))))
-                self.cafe_interval_max_var.set(max(1, int(cafe.get("delay_max", 30))))
-                ar = cafe.get("auto_restart") or {}
-                if isinstance(ar, dict) and ar.get("enabled"):
-                    self._auto_restart_enabled = True
-                    self._auto_restart_cafe = True
-                self._agent_use_new_cafe_list = bool(cafe.get("use_new_cafe_list", False))
-                self._log("[에이전트] 카페 설정 적용 완료")
-            else:
-                self._agent_use_new_cafe_list = getattr(self, "_agent_use_new_cafe_list", False)
-            self._log("[에이전트] 설정 적용 완료")
-        except Exception as e:
-            self._log(f"[에이전트] 설정 적용 오류: {e}")
-
-    def _agent_apply_config_then_start(self, mode, cmd_id=None, program_username=None, payload=None):
-        """설정 적용 후 작업 시작. mode: 'blog' | 'cafe' | 'cafe_join'. payload.immediate=True면 카페가입 즉시 실행"""
-        import traceback
-        try:
-            self._agent_apply_config()
-            if mode == "blog":
-                self._switch_tab_main("blog")
-                self._on_start_blog_posting(skip_confirm=True, cmd_id=cmd_id, program_username=program_username)
-                if cmd_id is not None:
-                    from supabase_client import mark_agent_command_done
-                    wt = getattr(self, "worker_thread", None)
-                    if wt and wt.is_alive():
-                        mark_agent_command_done(cmd_id, log=self._log)
-                    else:
-                        self.is_running = False
-                        err = getattr(self, "_last_start_error", None) or "worker thread not started"
-                        mark_agent_command_done(cmd_id, error_message=err, log=self._log)
-            elif mode == "cafe":
-                self._switch_tab_main("cafe")
-                cafes_override = None
-                use_loop = getattr(self, "_agent_use_new_cafe_list", False)
-                if use_loop:
-                    from auth import get_session
-                    from supabase_client import fetch_agent_cafe_lists
-                    s = get_session()
-                    # 로그인 아이디와 동일한 프로그램 유저네임 것만 사용 (다른 계정 것 사용 안 함)
-                    un = ((s or {}).get("username", "") or "").strip()
-                    if un:
-                        raw = fetch_agent_cafe_lists(un, statuses=["joined"], log=self._log)
-                        cafes_override = [{"cafe_id": c["cafe_id"], "menu_id": c["menu_id"]} for c in raw if (c.get("cafe_id") or "").strip() and (c.get("menu_id") or "").strip()]
-                        if cafes_override:
-                            self._log(f"[에이전트] 서버뉴카페 {len(cafes_override)}개로 포스팅 (완료 시 처음부터 반복)")
-                self._on_start_posting(skip_confirm=True, cafes_override=cafes_override, use_agent_cafe_loop=use_loop and bool(cafes_override))
-                if cmd_id is not None:
-                    from supabase_client import mark_agent_command_done
-                    mark_agent_command_done(cmd_id, log=self._log)
-            elif mode == "cafe_join":
-                self._run_cafe_join_job_async(cmd_id=cmd_id, program_username=program_username, payload=payload or {})
-            else:
-                if cmd_id is not None:
-                    from supabase_client import mark_agent_command_done
-                    mark_agent_command_done(cmd_id, log=self._log)
-        except Exception as e:
-            traceback.print_exc()
-            self.is_running = False
-            if cmd_id is not None:
-                try:
-                    from supabase_client import mark_agent_command_done, insert_agent_run
-                    if program_username:
-                        insert_agent_run(program_username, "error", message=str(e), log=self._log)
-                    mark_agent_command_done(cmd_id, error_message=str(e), log=self._log)
-                except Exception:
-                    pass
-
-    def _run_cafe_join_job_async(self, cmd_id=None, program_username=None, payload=None):
-        """카페가입 에이전트 작업을 스레드로 실행. payload.immediate=True면 날짜 체크 없이 즉시 실행"""
-        self._switch_tab_main("cafe")
-        from auth import get_session
-        from supabase_client import fetch_agent_config, fetch_app_links, mark_agent_command_done, insert_agent_run
-        from cafe_autojoin import run_cafe_join_job
-
-        s = get_session()
-        if not s or not s.get("username"):
-            self._cafe_log("[카페가입 에이전트] 로그인 필요")
-            if cmd_id:
-                mark_agent_command_done(cmd_id, error_message="로그인 필요", log=self._log)
-            return
-
-        owner_id = s.get("id")
-        un = program_username or s.get("username")
-        cfg = fetch_agent_config(un, owner_id, log=self._log)
-        blog_cfg = (cfg.get("config") or {}).get("blog") or {}
-        nid = (blog_cfg.get("naver_id") or "").strip()
-        npw = (blog_cfg.get("naver_pw") or "").strip()
-        # 다중아이디: naver_accounts 또는 naver_id_2/naver_pw_2
-        accounts = None
-        nav_acc = blog_cfg.get("naver_accounts")
-        if isinstance(nav_acc, list) and len(nav_acc) > 0:
-            accounts = [{"id": (a.get("id") or a.get("naver_id") or "").strip(), "pw": (a.get("pw") or a.get("naver_pw") or "").strip()} for a in nav_acc if (a.get("id") or a.get("naver_id") or "").strip() and (a.get("pw") or a.get("naver_pw") or "").strip()]
-        nid2 = (blog_cfg.get("naver_id_2") or "").strip()
-        npw2 = (blog_cfg.get("naver_pw_2") or "").strip()
-        if not accounts and nid2 and npw2:
-            accounts = [{"id": nid, "pw": npw}, {"id": nid2, "pw": npw2}]
-        if not nid or not npw:
-            if not (accounts and len(accounts) > 0):
-                self._cafe_log("[카페가입 에이전트] agent_config에 네이버 아이디/비밀번호 없음")
-                if cmd_id:
-                    mark_agent_command_done(cmd_id, error_message="네이버 계정 설정 필요", log=self._log)
-                return
-
-        links = fetch_app_links(log=self._log)
-        captcha = (links.get("captcha_api_key") or "").strip() or getattr(self, "_cafe_autojoin_captcha_key", "") or ""
-
-        # 명령 즉시 완료 처리 → 다음 폴에서 동일 명령 재수신·중복 실행 방지
-        if cmd_id:
-            mark_agent_command_done(cmd_id, log=self._log)
-
-        def _log(msg):
-            try:
-                self.root.after(0, lambda m=msg: self._cafe_log(m))
-            except Exception:
-                pass
-
-        def _progress(p, t):
-            try:
-                self.root.after(0, lambda pp=p, tt=t: self._update_cafe_progress(pp, tt))
-            except Exception:
-                pass
-
-        def _run():
-            try:
-                self.is_running = True
-                immediate = bool((payload or {}).get("immediate", False))
-                ok = run_cafe_join_job(
-                    owner_user_id=owner_id,
-                    program_username=un,
-                    naver_id=nid,
-                    naver_pw=npw,
-                    captcha_api_key=captcha or None,
-                    stop_flag=lambda: getattr(self, "_stop_flag", False),
-                    log=_log,
-                    on_progress=_progress,
-                    immediate=immediate,
-                    accounts=accounts,
-                )
-                if ok:
-                    try:
-                        last_run_file = os.path.join(BASE_DIR, ".cafe_join_last_run.json")
-                        with open(last_run_file, "w", encoding="utf-8") as f:
-                            json.dump({"date": datetime.datetime.now().strftime("%Y-%m-%d")}, f, ensure_ascii=False)
-                    except Exception:
-                        pass
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                _log(f"[카페가입 에이전트] 오류: {e}")
-                if cmd_id:
-                    mark_agent_command_done(cmd_id, error_message=str(e), log=self._log)
-                insert_agent_run(un, "error", message=str(e), log=self._log)
-            finally:
-                self.is_running = False
-
-        threading.Thread(target=_run, daemon=True).start()
-
-    def _agent_restart_loop(self):
-        """작업 루프 재시작 (안전 중지 후 대기 상태로)"""
-        self._stop_flag = True
-        self._log("[에이전트] 재시작 명령 — 안전 중지 후 대기")
-        self.root.after(500, self._agent_apply_config)
 
     # ──────────────────────────────────────────────
     # 자동 재시작 설정
@@ -4250,13 +4194,17 @@ class App:
             from auth import is_logged_in, get_session, get_free_use_until, logout
             if is_logged_in():
                 s = get_session()
+                self.current_user_id = s.get("id") if s else None
                 free_until = get_free_use_until() or "?"
                 self._auth_btn_register.set_text(" 내 정보 ")
                 self._auth_btn_register.set_command(self._open_my_info_dialog)
                 self._auth_btn_login.set_text(" 로그아웃 ")
                 self._auth_btn_login.set_command(self._on_logout)
                 self._auth_status_label.config(text=f"사용 가능 기간: ~{free_until}")
+                # [C] 로그인 시 Supabase에서 프로필/키워드 자동 로드
+                self._apply_user_profile_from_supabase()
             else:
+                self.current_user_id = None
                 self._auth_btn_register.set_text(" 회원가입 ")
                 self._auth_btn_register.set_command(self._open_register_dialog)
                 self._auth_btn_login.set_text(" 로그인 ")
@@ -4265,6 +4213,34 @@ class App:
             self._refresh_admin_ui()
         except Exception:
             pass
+
+    def _apply_user_profile_from_supabase(self):
+        """[C] 로그인 사용자의 프로필(쿠팡 키) 및 키워드를 Supabase에서 가져와 자동 입력"""
+        try:
+            from auth import get_session
+            from shared.gui_data import get_user_profile, get_user_keywords_or_fallback
+            s = get_session()
+            if not s:
+                return
+            username = s.get("username") or ""
+            user_id = s.get("id")
+            profile = get_user_profile(username=username, user_id=user_id, log=self._log)
+            if profile:
+                ak = profile.get("coupang_access_key", "")
+                sk = profile.get("coupang_secret_key", "")
+                if ak and hasattr(self, "coupang_ak_var"):
+                    self.coupang_ak_var.set(ak)
+                if sk and hasattr(self, "coupang_sk_var"):
+                    self.coupang_sk_var.set(sk)
+                self._log("[Supabase] 사용자 프로필(쿠팡 키) 자동 입력됨")
+            kw = get_user_keywords_or_fallback(username=username, user_id=user_id, log=self._log)
+            if kw:
+                self.keywords = kw
+                if hasattr(self, "_refresh_keywords_display"):
+                    self._refresh_keywords_display()
+                self._log(f"[Supabase] 키워드 {len(kw)}개 로드됨")
+        except Exception as e:
+            self._log(f"[Supabase] 프로필 로드 실패: {e}")
 
     def _open_register_dialog(self):
         """회원가입 팝업"""
@@ -4584,7 +4560,7 @@ class App:
     # LOGGING
     # ──────────────────────────────────────────────
     def _log(self, msg):
-        if "[AGENT]" in msg or "[BLOG]" in msg or "[CAFE]" in msg or "[에이전트]" in msg:
+        if "[BLOG]" in msg or "[CAFE]" in msg or "[실행시작]" in msg:
             self.append_log_global(msg)
         if not getattr(self, "log_text", None):
             return
@@ -4603,7 +4579,7 @@ class App:
         self.log_text.config(state="disabled")
 
     def _cafe_log(self, msg):
-        if "[AGENT]" in msg or "[BLOG]" in msg or "[CAFE]" in msg or "[에이전트]" in msg:
+        if "[BLOG]" in msg or "[CAFE]" in msg or "[실행시작]" in msg:
             self.append_log_global(msg)
         def _do():
             self.cafe_log_text.config(state="normal")
@@ -4679,6 +4655,20 @@ def _on_app_exit():
 
 
 if __name__ == "__main__":
+    # [E] 실행 확인용 로그
+    try:
+        from shared.sb import load_config
+        cfg = load_config()
+        if cfg is None:
+            from shared.sb import _config_error
+            print(f"[GUI] config 로드 실패: {_config_error}", flush=True)
+        else:
+            proj = cfg.get("PROJECT", "")
+            url = cfg.get("SUPABASE_URL", "")
+            print(f"[GUI] PROJECT={proj}, SUPABASE_URL={url[:50]}..." if len(url) > 50 else f"[GUI] PROJECT={proj}, SUPABASE_URL={url}", flush=True)
+    except Exception as e:
+        print(f"[GUI] config 로드 실패: {e}", flush=True)
+
     root = tk.Tk()
     app = App(root)
     _on_app_exit._app = app

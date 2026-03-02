@@ -98,11 +98,11 @@ def extract_cafe_info(cafe_url: str, timeout: int = 10, html: str | None = None)
 
     # menuid만 있는 경우 (메뉴명 없음) - 마지막에 추가
     for m in re.finditer(
-        r'search\.menuid=(\d+)|menuid=(\d+)|menu_id=(\d+)|menus/(\d+)',
+        r'search\.menuid=(\d+)|menuid=(\d+)|menu_id=(\d+)|menus/(\d+)|/cafes/\d+/menus/(\d+)',
         html,
         re.IGNORECASE,
     ):
-        mid = m.group(1) or m.group(2) or m.group(3) or m.group(4)
+        mid = m.group(1) or m.group(2) or m.group(3) or m.group(4) or m.group(5)
         if mid and mid not in seen:
             seen.add(mid)
             menus.append({"menu_name": mid, "menu_id": mid, "type": "일반"})
@@ -226,8 +226,11 @@ def pick_best_menu_id(menus: list, exclude_notice: bool = True) -> str | None:
         if is_excluded(name):
             continue
         mid = (m.get("menu_id") or "").strip()
-        if mid:
-            filtered.append(m)
+        if not mid:
+            continue
+        if mid == "0":
+            continue
+        filtered.append(m)
 
     if not filtered:
         return None

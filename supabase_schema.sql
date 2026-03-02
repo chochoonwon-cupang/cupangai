@@ -275,3 +275,17 @@ CREATE INDEX IF NOT EXISTS idx_agent_cafe_lists_status ON agent_cafe_lists(progr
 -- 캡챠 API 키 (app_links에 저장, link_key='captcha_api_key')
 -- INSERT INTO app_links (link_key, url) VALUES ('captcha_api_key', 'YOUR_CAPTCHA_API_KEY')
 -- ON CONFLICT (link_key) DO UPDATE SET url = EXCLUDED.url;
+
+-- vm_accounts 테이블 (VM별 네이버 계정 — 워커용)
+-- 워커는 VM_NAME으로 조회하여 naver_accounts 로드
+CREATE TABLE IF NOT EXISTS vm_accounts (
+    vm_name         TEXT PRIMARY KEY,
+    naver_accounts   JSONB NOT NULL DEFAULT '[]',
+    updated_at      TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE vm_accounts ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Allow anon read vm_accounts" ON vm_accounts FOR SELECT USING (true);
+-- 등록 예시 (Supabase SQL Editor):
+-- INSERT INTO vm_accounts (vm_name, naver_accounts) VALUES
+--   ('vm-001', '[{"id":"naver_id1","pw":"password1"},{"id":"naver_id2","pw":"password2"}]')
+-- ON CONFLICT (vm_name) DO UPDATE SET naver_accounts = EXCLUDED.naver_accounts, updated_at = now();

@@ -13,7 +13,7 @@ import json
 
 from config import GEMINI_API_KEY
 
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
 
 CATEGORIES = ["건강식품", "생활용품", "가전제품", "유아/출산", "기타"]
 

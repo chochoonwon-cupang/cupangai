@@ -1,10 +1,13 @@
 # ============================================================
 # Supabase 클라이언트 — 유료회원 데이터 관리
 # ============================================================
+# configs/app_config.json 기반 — shared.sb 사용
+# ============================================================
 
 import datetime
 
-from config import SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_KEY, OWNER_USER_ID
+from config import OWNER_USER_ID
+from shared.sb import get_client
 
 # 유효한 발행 카테고리 (이 목록에 없으면 기본값 '기타' 사용)
 VALID_CATEGORIES = ("건강식품", "생활용품", "가전제품", "유아/출산", "기타")
@@ -16,31 +19,13 @@ users 테이블: 추천인(referrer_id) 정보 — distribute_keyword, distribut
 
 
 def _get_client():
-    """Supabase 클라이언트 인스턴스를 생성합니다."""
-    try:
-        from supabase import create_client
-    except ImportError:
-        raise ImportError(
-            "supabase 패키지가 설치되어 있지 않습니다. "
-            "pip install supabase 를 실행하세요."
-        )
-    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        raise ValueError(
-            "config.py에 SUPABASE_URL과 SUPABASE_ANON_KEY를 설정하세요."
-        )
-    return create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    """Supabase 클라이언트 (anon key)"""
+    return get_client(use_service_role=False)
 
 
 def _get_service_client():
-    """RLS 우회용 service_role 클라이언트 (users 테이블 조회)"""
-    try:
-        from supabase import create_client
-    except ImportError:
-        raise ImportError("pip install supabase")
-    key = SUPABASE_SERVICE_KEY or ""
-    if not key:
-        raise ValueError("config.py에 SUPABASE_SERVICE_KEY를 설정하세요.")
-    return create_client(SUPABASE_URL, key)
+    """RLS 우회용 service_role 클라이언트"""
+    return get_client(use_service_role=True)
 
 
 def fetch_referrer(referrer_username: str, log=None):
@@ -105,27 +90,46 @@ def fetch_referrer(referrer_username: str, log=None):
         return None
 
 
-def fetch_user_coupang_keys(username: str, log=None):
+def fetch_user_coupang_keys(username: str = None, user_id: str = None, log=None):
     """
-    users 테이블에서 본인(로그인 사용자)의 쿠팡 API 키를 조회합니다.
-    본인글 작성 시 블로그·카페 모두 이 키를 사용합니다.
+    profiles 테이블에서 본인(로그인 사용자)의 쿠팡 API 키를 조회합니다.
+    SaaS 대시보드에서 저장한 값을 사용합니다.
+    username 또는 user_id로 조회. user_id 우선 (profiles.id 또는 profiles.user_id = auth.users.id).
 
     Returns:
         tuple[str, str] | None: (access_key, secret_key) 또는 None (키 없음/오류)
     """
     _log = log or print
-    username = (username or "").strip()
-    if not username:
+    uid = (user_id or "").strip()
+    un = (username or "").strip()
+    if not uid and not un:
         return None
     try:
         client = _get_service_client()
-        r = (
-            client.table("users")
-            .select("coupang_access_key, coupang_secret_key")
-            .eq("username", username)
-            .execute()
-        )
-        if not r.data or len(r.data) == 0:
+        r = None
+        if uid:
+            try:
+                r = client.table("profiles").select("coupang_access_key, coupang_secret_key").eq("user_id", uid).limit(1).execute()
+            except Exception:
+                pass
+            if not r or not r.data or len(r.data) == 0:
+                try:
+                    r = client.table("profiles").select("coupang_access_key, coupang_secret_key").eq("id", uid).limit(1).execute()
+                except Exception:
+                    pass
+        if un and (not r or not r.data or len(r.data) == 0):
+            try:
+                r = client.table("profiles").select("coupang_access_key, coupang_secret_key").eq("coupang_id", un).limit(1).execute()
+            except Exception:
+                pass
+            if not r or not r.data or len(r.data) == 0:
+                r = client.table("profiles").select("coupang_access_key, coupang_secret_key").eq("username", un).limit(1).execute()
+            if not r or not r.data or len(r.data) == 0:
+                try:
+                    r = client.table("profiles").select("coupang_access_key, coupang_secret_key").eq("login_id", un).limit(1).execute()
+                except Exception:
+                    pass
+        if not r or not r.data or len(r.data) == 0:
             return None
         row = r.data[0]
         ak = (row.get("coupang_access_key") or "").strip()
@@ -134,7 +138,7 @@ def fetch_user_coupang_keys(username: str, log=None):
             return None
         return (ak, sk)
     except Exception as e:
-        _log(f"[Supabase] users 쿠팡키 조회 실패: {e}")
+        _log(f"[Supabase] profiles 쿠팡키 조회 실패: {e}")
         return None
 
 
@@ -284,35 +288,9 @@ def delete_helper_cafe_by_url(cafe_url: str, log=None):
         return False
 
 
-def fetch_cafe_join_policy_for_program(program_username: str, owner_user_id: str = None, log=None):
-    """agent_configs.config.cafe_join 우선 조회. 없으면 cafe_join_policy(id=1) fallback."""
-    _log = log or print
-    try:
-        row = fetch_agent_config(program_username, owner_user_id=owner_user_id, log=_log)
-        cfg = row.get("config") or {}
-        cj = cfg.get("cafe_join")
-        if isinstance(cj, dict) and cj:
-            run_days = cj.get("run_days")
-            if not isinstance(run_days, list):
-                run_days = [4, 14, 24]
-            return {
-                "run_days": run_days,
-                "start_time": (cj.get("start_time") or "09:00").strip() or "09:00",
-                "created_year_min": int(cj.get("created_year_min") or 2020),
-                "created_year_max": int(cj.get("created_year_max") or 2025),
-                "recent_post_days": int(cj.get("recent_post_days") or 7),
-                "recent_post_enabled": bool(cj.get("recent_post_enabled", True)),
-                "target_count": int(cj.get("target_count") or 50),
-                "search_keyword": (cj.get("search_keyword") or "").strip(),
-            }
-    except Exception as e:
-        _log(f"[Supabase] agent_config cafe_join 조회 실패: {e}")
-    return fetch_cafe_join_policy(log=_log)
-
-
 def fetch_cafe_join_policy(log=None):
     """cafe_join_policy id=1 조회. 없으면 기본값 반환.
-    service_role 사용 (RLS 우회 — PC 에이전트가 정책 읽기 위해).
+    service_role 사용 (RLS 우회).
     실제 DB 컬럼명(min_created_year, max_created_year, require_no_recent_posts)과
     표준명(created_year_min 등) 모두 지원."""
     _log = log or print
@@ -335,14 +313,15 @@ def fetch_cafe_join_policy(log=None):
                 "recent_post_days": int(row.get("recent_post_days") or 7),
                 "recent_post_enabled": bool(recent_en),
                 "target_count": int(row.get("target_count") or 50),
+                "expire_days": int(row.get("expire_days") or 10),
                 "search_keyword": (row.get("search_keyword") or "").strip(),
             }
         return {"run_days": [4, 14, 24], "start_time": "09:00", "created_year_min": 2020, "created_year_max": 2025,
-                "recent_post_days": 7, "recent_post_enabled": True, "target_count": 50, "search_keyword": ""}
+                "recent_post_days": 7, "recent_post_enabled": True, "target_count": 50, "expire_days": 10, "search_keyword": ""}
     except Exception as e:
         _log(f"[Supabase] cafe_join_policy 조회 실패: {e}")
         return {"run_days": [4, 14, 24], "start_time": "09:00", "created_year_min": 2020, "created_year_max": 2025,
-                "recent_post_days": 7, "recent_post_enabled": True, "target_count": 50, "search_keyword": ""}
+                "recent_post_days": 7, "recent_post_enabled": True, "target_count": 50, "expire_days": 10, "search_keyword": ""}
 
 
 def upsert_cafe_join_policy(policy: dict, log=None):
@@ -385,15 +364,24 @@ def upsert_cafe_join_policy(policy: dict, log=None):
         return False
 
 
-def fetch_agent_cafe_lists(program_username: str, statuses=None, log=None, use_service=False):
-    """agent_cafe_lists에서 status='saved' 또는 'joined' 조회. use_service=True면 service_role 사용."""
+def fetch_program_cafe_lists(program_username=None, naver_id=None, statuses=None, log=None, use_service=False):
+    """
+    agent_cafe_lists에서 카페 리스트 조회.
+    - naver_id 우선: naver_id가 있으면 네이버 아이디별 조회
+    - program_username: 없으면 program_username으로 조회 (기존 호환)
+    """
     _log = log or print
     statuses = statuses or ["saved", "joined"]
     try:
         client = _get_service_client() if use_service else _get_client()
-        r = client.table("agent_cafe_lists").select("cafe_url, cafe_id, menu_id, status").eq(
-            "program_username", program_username
-        ).in_("status", statuses).order("created_at").execute()
+        q = client.table("agent_cafe_lists").select("cafe_url, cafe_id, menu_id, status").in_("status", statuses).order("created_at")
+        if naver_id and str(naver_id).strip():
+            q = q.eq("naver_id", str(naver_id).strip())
+        elif program_username and str(program_username).strip():
+            q = q.eq("program_username", str(program_username).strip())
+        else:
+            return []
+        r = q.execute()
         return [
             {"cafe_url": row.get("cafe_url"), "cafe_id": row.get("cafe_id"), "menu_id": row.get("menu_id")}
             for row in (r.data or [])
@@ -403,19 +391,32 @@ def fetch_agent_cafe_lists(program_username: str, statuses=None, log=None, use_s
         return []
 
 
-def insert_agent_cafe_list(owner_user_id, program_username, cafe_url, cafe_id=None, menu_id=None, status="saved", reject_reason=None, log=None):
-    """agent_cafe_lists에 insert. service_role 사용."""
+def _is_valid_uuid(s):
+    """UUID 형식인지 검사 (빈 문자열/None이면 False)."""
+    if not s or not str(s).strip():
+        return False
+    import re
+    return bool(re.match(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", str(s).strip()))
+
+
+def insert_program_cafe_list(owner_user_id, program_username, cafe_url, cafe_id=None, menu_id=None, status="saved", reject_reason=None, naver_id=None, vm_name=None, log=None):
+    """agent_cafe_lists에 insert. naver_id, vm_name 있으면 함께 저장. owner_user_id는 유효한 UUID일 때만 포함."""
     _log = log or print
     try:
         client = _get_service_client()
         data = {
-            "owner_user_id": owner_user_id,
-            "program_username": program_username,
+            "program_username": program_username or "",
             "cafe_url": cafe_url,
             "cafe_id": cafe_id or "",
             "menu_id": menu_id or "",
             "status": status,
         }
+        if _is_valid_uuid(owner_user_id):
+            data["owner_user_id"] = str(owner_user_id).strip()
+        if naver_id and str(naver_id).strip():
+            data["naver_id"] = str(naver_id).strip()
+        if vm_name and str(vm_name).strip():
+            data["vm_name"] = str(vm_name).strip()
         if reject_reason is not None:
             data["reject_reason"] = reject_reason
         client.table("agent_cafe_lists").insert(data).execute()
@@ -425,25 +426,87 @@ def insert_agent_cafe_list(owner_user_id, program_username, cafe_url, cafe_id=No
         return False
 
 
-def update_agent_cafe_list_status(cafe_url: str, program_username: str, status: str, reject_reason: str = None, cafe_id=None, menu_id=None, log=None):
-    """agent_cafe_lists status 업데이트. service_role 사용."""
+def update_program_cafe_list_status(cafe_url: str, program_username=None, naver_id=None, status: str = None, reject_reason: str = None, cafe_id=None, menu_id=None, last_posted_at=None, log=None):
+    """agent_cafe_lists status 업데이트. naver_id 또는 program_username으로 대상 지정."""
     _log = log or print
     try:
         client = _get_service_client()
-        data = {"status": status}
+        data = {}
+        if status is not None:
+            data["status"] = status
         if reject_reason is not None:
             data["reject_reason"] = reject_reason
         if cafe_id is not None:
             data["cafe_id"] = cafe_id
         if menu_id is not None:
             data["menu_id"] = menu_id
-        client.table("agent_cafe_lists").update(data).eq("cafe_url", cafe_url).eq(
-            "program_username", program_username
-        ).execute()
+        if last_posted_at is not None:
+            data["last_posted_at"] = last_posted_at
+        if not data:
+            return True
+        q = client.table("agent_cafe_lists").update(data).eq("cafe_url", cafe_url)
+        if naver_id and str(naver_id).strip():
+            q = q.eq("naver_id", str(naver_id).strip())
+        elif program_username and str(program_username).strip():
+            q = q.eq("program_username", str(program_username).strip())
+        else:
+            return False
+        q.execute()
         return True
     except Exception as e:
         _log(f"[Supabase] agent_cafe_lists update 실패: {e}")
         return False
+
+
+def delete_agent_cafe_list(cafe_url: str, naver_id=None, program_username=None, log=None):
+    """agent_cafe_lists에서 행 삭제 (글작성 실패 시 등)."""
+    _log = log or print
+    try:
+        client = _get_service_client()
+        q = client.table("agent_cafe_lists").delete().eq("cafe_url", cafe_url)
+        if naver_id and str(naver_id).strip():
+            q = q.eq("naver_id", str(naver_id).strip())
+        elif program_username and str(program_username).strip():
+            q = q.eq("program_username", str(program_username).strip())
+        else:
+            return False
+        q.execute()
+        return True
+    except Exception as e:
+        _log(f"[Supabase] agent_cafe_lists delete 실패: {e}")
+        return False
+
+
+def delete_expired_agent_cafes(naver_id: str, days: int = 10, log=None):
+    """last_posted_at이 days일 이전인 카페 삭제 (10일 경과 자동 삭제)."""
+    _log = log or print
+    if not naver_id or not str(naver_id).strip():
+        return 0
+    try:
+        from datetime import datetime, timezone, timedelta
+        client = _get_service_client()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        r = client.table("agent_cafe_lists").delete().eq("naver_id", str(naver_id).strip()).lt("last_posted_at", cutoff).execute()
+        n = len(r.data) if r.data else 0
+        if n > 0:
+            _log(f"[Supabase] agent_cafe_lists 10일 경과 {n}건 삭제 (naver_id={naver_id})")
+        return n
+    except Exception as e:
+        _log(f"[Supabase] delete_expired_agent_cafes 실패: {e}")
+        return 0
+
+
+def fetch_agent_cafe_lists_full(naver_id: str, statuses=None, log=None, use_service=True):
+    """agent_cafe_lists 전체 행 조회 (cafe_url 포함, last_posted_at 업데이트용)."""
+    _log = log or print
+    statuses = statuses or ["saved", "joined"]
+    try:
+        client = _get_service_client() if use_service else _get_client()
+        r = client.table("agent_cafe_lists").select("cafe_url, cafe_id, menu_id, last_posted_at").eq("naver_id", str(naver_id).strip()).in_("status", statuses).order("created_at").execute()
+        return [{"cafe_url": row.get("cafe_url"), "cafe_id": row.get("cafe_id"), "menu_id": row.get("menu_id"), "last_posted_at": row.get("last_posted_at")} for row in (r.data or [])]
+    except Exception as e:
+        _log(f"[Supabase] agent_cafe_lists full 조회 실패: {e}")
+        return []
 
 
 def fetch_helper_new_cafe_since(log=None):
@@ -471,22 +534,24 @@ def fetch_helper_new_cafe_since(log=None):
 def fetch_app_links(log=None):
     """
     Supabase app_links 테이블에서 링크 설정을 가져옵니다.
+    url 또는 value 컬럼 지원 (스키마에 따라 다름)
 
     Returns:
-        dict: link_key → url 매핑
+        dict: link_key → url/value 매핑
             - inquiry: 문의접수 링크
             - tutorial_video: 프로그램 사용법 영상 링크
             - banner: 하단배너 링크
+            - captcha_api_key: 2captcha API 키
         빈 dict: 데이터 없거나 오류 발생 시
     """
     _log = log or print
     try:
         client = _get_client()
-        r = client.table("app_links").select("link_key, url").execute()
+        r = client.table("app_links").select("*").execute()
         links = {}
         for row in (r.data or []):
             k = (row.get("link_key") or "").strip()
-            v = (row.get("url") or "").strip()
+            v = (row.get("url") or row.get("value") or "").strip()
             if k and v:
                 links[k] = v
         if links:
@@ -599,217 +664,6 @@ def fetch_paid_member_keywords_pool(count=None, log=None):
         # 부족하면 중복 허용
         return [random.choice(pool) for _ in range(count)]
     return pool
-
-
-# ─────────────────────────────────────────────────────────────
-# tasks 테이블 (SaaS 에이전트 모드)
-# ─────────────────────────────────────────────────────────────
-
-def fetch_pending_task(log=None):
-    """
-    status='pending' (또는 '대기')인 작업 1건을 가져옵니다. (가장 오래된 것)
-    service_role 사용 (RLS 우회)
-
-    Returns:
-        dict | None: {"id", "keyword", "status", "result_url", "created_at"} 또는 None
-    """
-    _log = log or print
-    try:
-        client = _get_service_client()
-        r = (
-            client.table("tasks")
-            .select("id, keyword, status, result_url, created_at")
-            .in_("status", ["pending", "대기"])
-            .order("created_at")
-            .limit(1)
-            .execute()
-        )
-        if r.data and len(r.data) > 0:
-            return dict(r.data[0])
-        return None
-    except Exception as e:
-        _log(f"[Supabase] tasks 대기 작업 조회 실패: {e}")
-        return None
-
-
-def update_task_status(task_id, status, result_url=None, error_message=None, log=None):
-    """
-    tasks 테이블의 status(및 result_url, error_message)를 업데이트합니다.
-    status: 'processing' | 'completed' | 'failed' (또는 '진행'|'완료' 호환)
-    """
-    _log = log or print
-    try:
-        from datetime import datetime, timezone
-        client = _get_service_client()
-        data = {"status": status, "updated_at": datetime.now(timezone.utc).isoformat()}
-        if result_url is not None:
-            data["result_url"] = result_url
-        if error_message is not None:
-            data["error_message"] = error_message
-        client.table("tasks").update(data).eq("id", task_id).execute()
-        _log(f"[Supabase] tasks id={task_id} → status={status}")
-    except Exception as e:
-        _log(f"[Supabase] tasks 업데이트 실패: {e}")
-
-
-# ─────────────────────────────────────────────────────────────
-# agent_commands / agent_configs / agent_heartbeats (에이전트 모드)
-# ─────────────────────────────────────────────────────────────
-
-def fetch_pending_stop_commands(program_username: str, limit=20, log=None):
-    """
-    status='pending' 이면서 command='stop' 인 row들 조회 (최우선 처리용).
-    Returns: [{"id", "command", ...}, ...] (빈 리스트 가능)
-    """
-    _log = log or print
-    try:
-        client = _get_service_client()
-        r = (
-            client.table("agent_commands")
-            .select("id, command, payload, created_at")
-            .eq("program_username", program_username)
-            .eq("status", "pending")
-            .eq("command", "stop")
-            .order("created_at", desc=False)
-            .limit(limit)
-            .execute()
-        )
-        rows = []
-        if r.data:
-            for raw in r.data:
-                row = dict(raw)
-                row["command"] = "stop"
-                row["payload"] = row.get("payload") or {}
-                rows.append(row)
-        return rows
-    except Exception as e:
-        _log(f"[Supabase] agent_commands stop 조회 실패: {e}")
-        return []
-
-
-def fetch_pending_agent_commands(program_username: str, limit=20, exclude_stop=False, log=None):
-    """
-    agent_commands에서 status='pending'인 명령을 created_at asc로 limit건 조회.
-    exclude_stop=True: (A)에서 stop 처리했으므로 stop 제외.
-    Returns: [{"id", "command", "payload", ...}, ...] (빈 리스트 가능)
-    """
-    _log = log or print
-    try:
-        client = _get_service_client()
-        q = (
-            client.table("agent_commands")
-            .select("id, command, payload, created_at")
-            .eq("program_username", program_username)
-            .eq("status", "pending")
-            .order("created_at", desc=False)
-            .limit(limit)
-        )
-        if exclude_stop:
-            q = q.neq("command", "stop")
-        r = q.execute()
-        rows = []
-        if r.data:
-            for raw in r.data:
-                row = dict(raw)
-                cmd = row.get("command")
-                # 신규: command=문자열, payload=별도 컬럼
-                if isinstance(cmd, str):
-                    row["command"] = cmd
-                    row["payload"] = row.get("payload") or {}
-                # 구버전: command에 {command, payload} JSON 저장
-                elif isinstance(cmd, dict):
-                    row["command"] = cmd.get("command")
-                    row["payload"] = cmd.get("payload") or {}
-                else:
-                    row["command"] = str(cmd) if cmd else ""
-                    row["payload"] = row.get("payload") or {}
-                rows.append(row)
-        return rows
-    except Exception as e:
-        _log(f"[Supabase] agent_commands 조회 실패: {e}")
-        return []
-
-
-def mark_agent_command_done(cmd_id, error_message=None, log=None):
-    """agent_commands row를 done으로 업데이트. error_message 있으면 기록"""
-    _log = log or print
-    try:
-        from datetime import datetime, timezone
-        client = _get_service_client()
-        data = {
-            "status": "done",
-            "processed_at": datetime.now(timezone.utc).isoformat(),
-        }
-        if error_message is not None:
-            data["error_message"] = str(error_message)[:2000]
-        client.table("agent_commands").update(data).eq("id", cmd_id).execute()
-        _log(f"[Supabase] agent_commands id={cmd_id} → done" + (f" (error: {(error_message[:80] + '...') if len(error_message) > 80 else error_message})" if error_message else ""))
-    except Exception as e:
-        _log(f"[Supabase] agent_commands 업데이트 실패: {e}")
-
-
-def mark_agent_command_error(cmd_id, error_message, log=None):
-    """agent_commands row를 status='error'로 업데이트"""
-    _log = log or print
-    try:
-        from datetime import datetime, timezone
-        client = _get_service_client()
-        data = {
-            "status": "error",
-            "processed_at": datetime.now(timezone.utc).isoformat(),
-            "error_message": str(error_message)[:2000],
-        }
-        client.table("agent_commands").update(data).eq("id", cmd_id).execute()
-        _log(f"[Supabase] agent_commands id={cmd_id} → error: {str(error_message)[:80]}")
-    except Exception as e:
-        _log(f"[Supabase] agent_commands 업데이트 실패: {e}")
-
-
-def fetch_agent_config(program_username: str, owner_user_id: str = None, log=None):
-    """agent_configs에서 config 조회. owner_user_id 있으면 복합키로, 없으면 program_username만으로 조회(구버전 호환)"""
-    _log = log or print
-    try:
-        client = _get_service_client()
-        q = client.table("agent_configs").select("config, updated_at").eq("program_username", program_username)
-        if owner_user_id:
-            q = q.eq("owner_user_id", owner_user_id)
-        r = q.execute()
-        if r.data and len(r.data) > 0:
-            return dict(r.data[0])
-        return {}
-    except Exception as e:
-        _log(f"[Supabase] agent_configs 조회 실패: {e}")
-        return {}
-
-
-def insert_agent_run(program_username: str, status: str, message: str = None, log=None):
-    """agent_runs에 start/stop/error 기록 (디버깅용)"""
-    _log = log or print
-    if status not in ("started", "stopped", "error"):
-        return
-    try:
-        client = _get_service_client()
-        payload = {"program_username": program_username, "status": status}
-        if message:
-            payload["message"] = str(message)[:2000]
-        client.table("agent_runs").insert(payload).execute()
-        _log(f"[Supabase] agent_runs: {status}" + (f" — {(message[:80] + '...') if len(message) > 80 else message}" if message else ""))
-    except Exception as e:
-        _log(f"[Supabase] agent_runs insert 실패: {e}")
-
-
-def agent_heartbeat(program_username: str, log=None):
-    """agent_heartbeats에 heartbeat 기록"""
-    _log = log or print
-    try:
-        from datetime import datetime, timezone
-        client = _get_service_client()
-        client.table("agent_heartbeats").upsert({
-            "program_username": program_username,
-            "last_heartbeat_at": datetime.now(timezone.utc).isoformat(),
-        }, on_conflict="program_username").execute()
-    except Exception as e:
-        _log(f"[Supabase] agent_heartbeat 실패: {e}")
 
 
 # ─────────────────────────────────────────────────────────────

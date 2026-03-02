@@ -1,6 +1,8 @@
 .vercel
+.env
 .env*.local
 .auth_session.json
+configs/app_config.json
 
 # Python
 __pycache__

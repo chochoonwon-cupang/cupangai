@@ -38,12 +38,19 @@ BITLY_ACCESS_TOKEN = "YOUR_BITLY_ACCESS_TOKEN"
 # 가비아+Vercel 연결된 리다이렉트 주소
 REDIRECT_BASE_URL = "https://go.kdgc.co.kr/go"
 
-# ── Supabase (유료회원 데이터 서버) ──
-# Supabase 프로젝트 대시보드 → Settings → API 에서 확인
-SUPABASE_URL      = "https://vdyliufqshfdhvjshdfa.supabase.co"   # 예: "https://xxxx.supabase.co"
-SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZkeWxpdWZxc2hmZGh2anNoZGZhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA3MDg1NDMsImV4cCI6MjA4NjI4NDU0M30.JIiDmwFXx1gJ4jaYs8wfhoKpO9JKyga1v0YRg2CgEMk"   # 예: "eyJhbGciOi..."
-# 회원가입/로그인용 (RLS 우회) — Settings > API > service_role key
-SUPABASE_SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZkeWxpdWZxc2hmZGh2anNoZGZhIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MDcwODU0MywiZXhwIjoyMDg2Mjg0NTQzfQ.7TBA_6bh66GMIuGlD6UYn5R4tzQfv4nl2GjDsy7w1cU"   # service_role key 입력 (auth.py에서 사용)
+# ── Supabase (configs/app_config.json에서 로드) ──
+# Supabase 설정은 configs/app_config.json에서만 관리합니다.
+def _load_supabase_from_config():
+    try:
+        from shared.sb import load_config
+        c = load_config()
+        return c.get("SUPABASE_URL", ""), c.get("SUPABASE_ANON_KEY", ""), c.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    except Exception:
+        return "", "", ""
+_sb_url, _sb_anon, _sb_svc = _load_supabase_from_config()
+SUPABASE_URL = _sb_url
+SUPABASE_ANON_KEY = _sb_anon
+SUPABASE_SERVICE_KEY = _sb_svc  # auth.py 등에서 사용
 
 # ── 기본 설정 ──
 IMAGE_SAVE_DIR = "images"           # 이미지 저장 폴더

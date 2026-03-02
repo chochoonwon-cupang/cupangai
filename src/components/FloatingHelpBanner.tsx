@@ -19,6 +19,21 @@ export default function FloatingHelpBanner({ onGuideClick }: Props) {
         mounted ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
       }`}
     >
+      {/* 사용자 로그인 버튼 */}
+      <button
+        type="button"
+        onClick={() => {
+          window.open(
+            "/user-auth",
+            "userAuth",
+            "width=420,height=680,menubar=no,toolbar=no,location=no,status=no,resizable=yes,scrollbars=yes"
+          );
+        }}
+        className="rounded-full bg-indigo-500 px-4 py-3 text-sm font-semibold text-white shadow-lg transition-all duration-300 hover:scale-105 hover:bg-indigo-600 md:px-6 md:py-4 md:text-base"
+      >
+        사용자 로그인
+      </button>
+
       {/* 이용안내 버튼 */}
       <button
         type="button"

@@ -304,12 +304,12 @@ function CafeJoinPolicyTab({
               />
             </div>
             <div>
-              <label className="mb-1 block text-xs text-slate-400">검색 키워드 (비워두면 랜덤 키워드 사용)</label>
+              <label className="mb-1 block text-xs text-slate-400">검색 키워드 (쉼표 구분 여러 개 → 가입 시 랜덤 선택)</label>
               <input
                 type="text"
                 value={policy.search_keyword}
                 onChange={(e) => setPolicy((p) => ({ ...p, search_keyword: e.target.value }))}
-                placeholder="카페 검색 키워드 (미입력 시 랜덤)"
+                placeholder="예: 건강, 다이어트, 요리, 여행 (미입력 시 기본 풀에서 랜덤)"
                 className="w-full max-w-xs rounded-lg border border-slate-600 bg-slate-800/80 px-3 py-2 text-sm text-slate-100 placeholder-slate-500 outline-none focus:border-indigo-500"
               />
             </div>

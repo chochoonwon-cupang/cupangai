@@ -6,6 +6,9 @@
 # ============================================================
 
 import time
+
+# naver_id별 검색 결과 캐시 (다 사용할 때까지 재사용, 다 쓰면 새 키워드로 검색)
+_search_cache = {}
 import base64
 import random
 import requests
@@ -807,16 +810,20 @@ def _try_join_one(driver, idx, cafe_name, cafe_url, cafe_id, menu_id, captcha_ap
                     pass
             _close_popup_if_any(driver, main_handles)
 
-        # 가입 완료 후 cafe_id, menu_id 추출 (helper_cafes 등록용)
+        # 가입 완료 후 cafe_id, menu_id 추출 (로그인 상태 드라이버로 재추출 — requests는 비로그인이라 메뉴 미노출)
         out_cid = cafe_id
         out_mid = menu_id
         try:
             from cafe_extractor import extract_cafe_info, pick_best_menu_id
-            info = extract_cafe_info(cafe_url)
+            _ensure_valid_window(driver)
+            driver.get(cafe_url)
+            time.sleep(2)
+            member_html = driver.page_source or ""
+            info = extract_cafe_info(cafe_url, html=member_html)
             if info.get("cafe_id") and info.get("menus"):
                 out_cid = info["cafe_id"]
                 best_mid = pick_best_menu_id(info["menus"], exclude_notice=True)
-                if best_mid:
+                if best_mid and best_mid != "0":
                     out_mid = best_mid
                     _log(f"[도우미 가입] [{idx}] {cafe_name} - 추출: cafe_id={out_cid}, menu_id={out_mid}")
         except Exception as ex:
@@ -1023,29 +1030,32 @@ def run_cafe_join_job(
     on_progress=None,
     immediate=False,
     accounts=None,
+    vm_name=None,
+    target_count_override=None,
+    driver_holder=None,
 ):
     """
-    카페 자동가입 에이전트 작업.
-    - immediate=True: 날짜 체크 없이 즉시 실행 (카페가입시작 버튼)
+    카페 자동가입 작업.
+    - immediate=True: 날짜 체크 없이 즉시 실행
     - immediate=False: 오늘 날짜가 run_days에 포함될 때만 실행
+    - post_tasks channel='cafe_autojoin'로 worker가 호출하거나, GUI에서 직접 호출 가능
     """
     from datetime import datetime
     from cafe_search import search_naver_cafes_selenium
     from cafe_extractor import extract_cafe_info, pick_best_menu_id, check_cafe_created_year, extract_cafe_created_year, check_no_recent_post
     from supabase_client import (
-        fetch_cafe_join_policy_for_program,
-        fetch_agent_config,
-        fetch_agent_cafe_lists,
-        insert_agent_cafe_list,
-        update_agent_cafe_list_status,
+        fetch_cafe_join_policy,
+        fetch_program_cafe_lists,
+        insert_program_cafe_list,
     )
 
     _log = log or print
     stop_flag = stop_flag or (lambda: False)
-    driver_holder = {}
+    driver_holder = driver_holder if isinstance(driver_holder, dict) else {}
+    driver_owned_here = not driver_holder.get("driver")
 
     try:
-        policy = fetch_cafe_join_policy_for_program(program_username, owner_user_id=owner_user_id, log=_log)
+        policy = fetch_cafe_join_policy(log=_log)
         if not immediate:
             run_days_raw = policy.get("run_days") or [4, 14, 24]
             now = datetime.now()
@@ -1053,30 +1063,21 @@ def run_cafe_join_job(
             year, month = now.year, now.month
             run_days = _resolve_run_days(run_days_raw, year, month)
             if today not in run_days:
-                _log(f"[카페가입 에이전트] 오늘({today}일)은 실행일이 아님 (선택={run_days_raw} → 해당일={run_days})")
+                _log(f"[카페가입] 오늘({today}일)은 실행일이 아님 (선택={run_days_raw} → 해당일={run_days})")
                 return False
 
-        keyword = (policy.get("search_keyword") or "").strip()
-        if not keyword:
-            cfg = fetch_agent_config(program_username, owner_user_id, log=_log)
-            blog_cfg = (cfg.get("config") or {}).get("blog") or {}
-            if isinstance(blog_cfg, dict):
-                keyword = (blog_cfg.get("keyword") or "").strip()
-            else:
-                keyword = ""
-        if not keyword:
-            _DEFAULT_KEYWORDS = [
-                "건강", "다이어트", "요리", "영화", "음악", "게임", "맛집", "여행", "부동산", "재테크",
-                "육아", "반려동물", "뷰티", "패션", "운동", "독서", "취미", "인테리어", "자동차", "IT",
-            ]
-            keyword = random.choice(_DEFAULT_KEYWORDS)
-            _log(f"[카페가입 에이전트] 검색 키워드 미설정 → 랜덤 키워드 사용: {keyword}")
+        _DEFAULT_KEYWORDS = [
+            "건강", "다이어트", "요리", "영화", "음악", "게임", "맛집", "여행", "부동산", "재테크",
+            "육아", "반려동물", "뷰티", "패션", "운동", "독서", "취미", "인테리어", "자동차", "IT",
+        ]
+        raw = (policy.get("search_keyword") or "").strip()
+        kw_list = [k.strip() for k in raw.split(",") if k.strip()] or _DEFAULT_KEYWORDS.copy()
 
         year_min = int(policy.get("created_year_min") or 2020)
         year_max = int(policy.get("created_year_max") or 2025)
         recent_days = int(policy.get("recent_post_days") or 7)
         recent_enabled = bool(policy.get("recent_post_enabled", True))
-        target_count = int(policy.get("target_count") or 50)
+        target_count = int(target_count_override) if target_count_override is not None else int(policy.get("target_count") or 50)
 
         # accounts: 다중아이디. 없으면 단일 계정
         if accounts and len(accounts) > 0:
@@ -1084,55 +1085,96 @@ def run_cafe_join_job(
         else:
             acc_list = [{"id": (naver_id or "").strip(), "pw": (naver_pw or "").strip()}] if (naver_id or "").strip() and (naver_pw or "").strip() else []
         if not acc_list:
-            _log("[카페가입 에이전트] 네이버 아이디/비밀번호 없음")
+            _log("[카페가입] 네이버 아이디/비밀번호 없음")
             return False
+        cache_key = acc_list[0]["id"].strip()
 
-        from cafe_poster import setup_driver, login_to_naver, safe_quit_driver
-        driver = setup_driver(headless=False)
-        driver_holder["driver"] = driver
+        from cafe_poster import setup_driver, login_to_naver, safe_quit_driver, needs_naver_login
+        driver = driver_holder.get("driver")
+        had_driver = driver is not None
+        if not driver:
+            driver = setup_driver(headless=False)
+            driver_holder["driver"] = driver
 
-        if on_progress:
-            on_progress(5, "네이버 로그인 중...")
-        if not login_to_naver(driver, acc_list[0]["id"], acc_list[0]["pw"], log=_log):
-            _log("[카페가입 에이전트] 네이버 로그인 실패")
-            return False
+        # driver_holder에서 재사용 시: 이미 로그인되어 있으면 로그인 생략 (기존 창 유지)
+        if had_driver and not needs_naver_login(driver):
+            _log("[카페가입] ✔ 기존 브라우저 로그인 유지")
+        else:
+            if on_progress:
+                on_progress(5, "네이버 로그인 중...")
+            if not login_to_naver(driver, acc_list[0]["id"], acc_list[0]["pw"], log=_log):
+                _log("[카페가입] 네이버 로그인 실패")
+                return False
         last_acc_idx = 0
         time.sleep(2)
 
-        # section.cafe.naver.com 로그인 후 검색 (Selenium)
-        if on_progress:
-            on_progress(10, "카페 검색 중...")
-        urls = search_naver_cafes_selenium(
-            driver, keyword, max_pages=200, stop_flag=stop_flag, log=_log
-        )
-        _log(f"[카페가입 에이전트] 검색 결과 {len(urls)}개 카페")
-
-        # 맨뒤 페이지(마지막 페이지) 카페부터 확인·가입 (앞쪽은 최근/운영중 카페 많음 → 뒤쪽이 비운영 카페 위주)
-        urls_reversed = list(reversed(urls))
-        _log(f"[카페가입 에이전트] 맨뒤 페이지부터 순서로 확인 및 가입 진행")
+        # 기존 가입/저장된 카페 URL (중복 가입 방지)
         existing_urls = set()
         try:
-            existing = fetch_agent_cafe_lists(program_username, statuses=["saved", "joined", "rejected"], use_service=True, log=_log)
-            existing_urls = {c.get("cafe_url") for c in existing if c.get("cafe_url")}
+            for acc in acc_list:
+                nid = acc.get("id", "").strip()
+                if nid:
+                    existing = fetch_program_cafe_lists(naver_id=nid, statuses=["saved", "joined", "rejected"], use_service=True, log=_log)
+                    for c in existing:
+                        if c.get("cafe_url"):
+                            existing_urls.add(c["cafe_url"])
         except Exception:
             pass
 
+        # 최근 검색 결과 캐시 재사용 (다 쓸 때만 새 키워드로 검색)
+        global _search_cache
+        cache = _search_cache.get(cache_key) if cache_key else None
+        urls_to_try = []
+        if cache:
+            candidates = [u for u in cache["urls"] if u not in cache["used"] and u not in existing_urls]
+            if candidates:
+                urls_to_try = candidates
+                _log(f"[카페가입] 캐시 재사용: '{cache['keyword']}' 검색 결과 {len(candidates)}개 남음")
+            else:
+                cache = None
+        if not urls_to_try:
+            # 캐시 없음 또는 소진 → 새 키워드로 검색 (이전과 다른 키워드 선택)
+            prev_kw = (cache.get("keyword") if isinstance(cache, dict) else None) or ""
+            keyword = random.choice(kw_list)
+            if len(kw_list) > 1:
+                while keyword == prev_kw:
+                    keyword = random.choice(kw_list)
+            if on_progress:
+                on_progress(10, "카페 검색 중...")
+            urls = search_naver_cafes_selenium(
+                driver, keyword, max_pages=200, stop_flag=stop_flag, log=_log
+            )
+            urls_reversed = list(reversed(urls))
+            _log(f"[카페가입] 검색 결과 {len(urls)}개 카페 (키워드: {keyword})")
+            _search_cache[cache_key] = {"urls": urls_reversed, "used": set(), "keyword": keyword}
+            urls_to_try = [u for u in urls_reversed if u not in existing_urls]
+
         joined_count = 0
-        total = len(urls_reversed)
+        total = len(urls_to_try)
         attempt_idx = 0  # 가입 시도 횟수 (다중아이디 교체용)
 
-        def _agent_cb(cafe_url, success, cafe_id, menu_id, reason):
-            status = "joined" if success else "rejected"
-            insert_agent_cafe_list(owner_user_id, program_username, cafe_url, cafe_id, menu_id, status=status, reject_reason=reason if not success else None, log=_log)
+        # agent_cafe_lists에 등록하지 않을 reject_reason (가입대기중, 가입실패 등)
+        _SKIP_INSERT_REASONS = ("가입대기중", "가입 대기중", "가입실패", "가입 실패")
 
-        for i, cafe_url in enumerate(urls_reversed):
+        def _agent_cb(cafe_url, success, cafe_id, menu_id, reason, current_naver_id):
+            if not success and reason and str(reason).strip() in _SKIP_INSERT_REASONS:
+                _log(f"[카페가입] {reason} — agent_cafe_lists 미등록: {cafe_url[:50]}...")
+                return
+            status = "joined" if success else "rejected"
+            insert_program_cafe_list(
+                owner_user_id, program_username, cafe_url, cafe_id, menu_id,
+                status=status, reject_reason=reason if not success else None,
+                naver_id=current_naver_id, vm_name=vm_name, log=_log
+            )
+
+        for i, cafe_url in enumerate(urls_to_try):
             if stop_flag():
-                _log("[카페가입 에이전트] 중지됨")
+                _log("[카페가입] 중지됨")
                 break
             if cafe_url in existing_urls:
                 continue
             if joined_count >= target_count:
-                _log(f"[카페가입 에이전트] 목표 {target_count}개 달성")
+                _log(f"[카페가입] 목표 {target_count}개 달성")
                 break
 
             if on_progress:
@@ -1147,6 +1189,8 @@ def run_cafe_join_job(
 
                 info = extract_cafe_info(cafe_url, html=main_html)
                 if info.get("error") or not info.get("cafe_id"):
+                    if cache_key and cache_key in _search_cache:
+                        _search_cache[cache_key]["used"].add(cafe_url)
                     continue
                 cafe_id = info["cafe_id"]
                 menus = info.get("menus") or []
@@ -1155,7 +1199,9 @@ def run_cafe_join_job(
                 year_ok = check_cafe_created_year(main_html, year_min, year_max)
                 if year_ok is False:
                     detected_year = extract_cafe_created_year(main_html)
-                    _log(f"[카페가입 에이전트] 생성년도 불일치 스킵 (개설년도: {detected_year}, 허용: {year_min}~{year_max}): {cafe_url[:50]}...")
+                    _log(f"[카페가입] 생성년도 불일치 스킵 (개설년도: {detected_year}, 허용: {year_min}~{year_max}): {cafe_url[:50]}...")
+                    if cache_key and cache_key in _search_cache:
+                        _search_cache[cache_key]["used"].add(cafe_url)
                     continue
 
                 if recent_enabled:
@@ -1176,16 +1222,18 @@ def run_cafe_join_job(
                             continue
                     no_recent = check_no_recent_post(art_html or main_html, within_days=recent_days)
                     if no_recent is False:
-                        _log(f"[카페가입 에이전트] 최근글 있음 스킵 ({recent_days}일 이내): {cafe_url[:50]}...")
+                        _log(f"[카페가입] 최근글 있음 스킵 ({recent_days}일 이내): {cafe_url[:50]}...")
+                        if cache_key and cache_key in _search_cache:
+                            _search_cache[cache_key]["used"].add(cafe_url)
                         continue
 
                 # 다중아이디: 해당 시도에 사용할 계정으로 전환
                 acc_idx = attempt_idx % len(acc_list)
                 if acc_idx != last_acc_idx:
                     acc = acc_list[acc_idx]
-                    _log(f"[카페가입 에이전트] 계정 전환: {acc['id']} ({acc_idx+1}/{len(acc_list)})")
+                    _log(f"[카페가입] 계정 전환: {acc['id']} ({acc_idx+1}/{len(acc_list)})")
                     if not login_to_naver(driver, acc["id"], acc["pw"], log=_log):
-                        _log(f"[카페가입 에이전트] 계정 {acc['id']} 로그인 실패, 스킵")
+                        _log(f"[카페가입] 계정 {acc['id']} 로그인 실패, 스킵")
                         continue
                     last_acc_idx = acc_idx
                     time.sleep(2)
@@ -1206,32 +1254,36 @@ def run_cafe_join_job(
                     if write_ok:
                         joined_count += 1
                         existing_urls.add(cafe_url)
-                        _agent_cb(cafe_url, True, r_cid, r_mid, None)
-                        _log(f"[카페가입 에이전트] 가입 완료: {cafe_url[:50]}... ({joined_count}/{target_count})")
+                        _agent_cb(cafe_url, True, r_cid, r_mid, None, acc_list[last_acc_idx]["id"])
+                        _log(f"[카페가입] 가입 완료: {cafe_url[:50]}... ({joined_count}/{target_count})")
                     else:
-                        _agent_cb(cafe_url, False, cafe_id, menu_id, "가입 대기중")
-                        _log(f"[카페가입 에이전트] 가입 대기중 — 글쓰기 불가, 저장 안 함: {cafe_url[:50]}...")
+                        _agent_cb(cafe_url, False, cafe_id, menu_id, "가입 대기중", acc_list[last_acc_idx]["id"])
+                        _log(f"[카페가입] 가입 대기중 — 글쓰기 불가, 저장 안 함: {cafe_url[:50]}...")
                 else:
-                    _agent_cb(cafe_url, False, cafe_id, menu_id, "가입 실패")
+                    _agent_cb(cafe_url, False, cafe_id, menu_id, "가입 실패", acc_list[last_acc_idx]["id"])
+                # 처리한 카페는 캐시 used에 추가 (재시도 방지)
+                if cache_key and cache_key in _search_cache:
+                    _search_cache[cache_key]["used"].add(cafe_url)
 
             except Exception as ex:
-                _log(f"[카페가입 에이전트] 오류 {cafe_url[:40]}: {ex}")
+                _log(f"[카페가입] 오류 {cafe_url[:40]}: {ex}")
             time.sleep(1)
 
         if on_progress:
             on_progress(100, "완료")
-        _log(f"[카페가입 에이전트] 작업 완료 (가입 {joined_count}개)")
+        _log(f"[카페가입] 작업 완료 (가입 {joined_count}개)")
         return True
     except Exception as e:
-        _log(f"[카페가입 에이전트] 오류: {e}")
+        _log(f"[카페가입] 오류: {e}")
         import traceback
         traceback.print_exc()
         return False
     finally:
-        d = driver_holder.get("driver")
-        if d:
-            try:
-                safe_quit_driver(d)
-            except Exception:
-                pass
-            driver_holder["driver"] = None
+        if driver_owned_here:
+            d = driver_holder.get("driver")
+            if d:
+                try:
+                    safe_quit_driver(d)
+                except Exception:
+                    pass
+                driver_holder["driver"] = None

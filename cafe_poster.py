@@ -198,6 +198,20 @@ def login_to_naver(driver, naver_id, naver_pw, log=None):
         return False
 
 
+def needs_naver_login(driver):
+    """
+    기존 driver가 네이버 로그인 상태인지 확인.
+    Returns True if login is needed (redirected to nidlogin), False if already logged in.
+    """
+    try:
+        driver.get("https://section.cafe.naver.com")
+        time.sleep(2)
+        url = driver.current_url
+        return "nidlogin" in url or "nid.naver.com" in url
+    except Exception:
+        return True
+
+
 # ─────────────────────────────────────────────────────────────
 # 3. 카페 글쓰기 페이지 이동 + 제목/본문 입력
 # ─────────────────────────────────────────────────────────────
@@ -436,7 +450,11 @@ def write_cafe_post(driver, cafe_id, menu_id, title, body,
         log: 로그 콜백 함수
 
     Returns:
-        bool: 성공 여부
+        tuple[bool, str|None]: (성공 여부, 실패 사유)
+        - (True, None): 성공
+        - (False, "member_required"): 회원이 아님
+        - (False, "button_not_found"): 등록 버튼 못 찾음
+        - (False, "exception"): 글작성 중 예외 (일시적 오류)
     """
     _log = log or print
 
@@ -467,7 +485,7 @@ def write_cafe_post(driver, cafe_id, menu_id, title, body,
         body_text = driver.find_element(By.TAG_NAME, "body").text
         if "회원이 아닙니다" in body_text or "회원이 아니" in body_text or "가입해 주세요" in body_text:
             _log(f"[포스팅] ✘ 이 카페의 회원이 아닙니다. 먼저 카페에 가입해주세요. (cafe_id={cafe_id})")
-            return False
+            return (False, "member_required")
     except Exception:
         pass
 
@@ -621,14 +639,14 @@ def write_cafe_post(driver, cafe_id, menu_id, title, body,
         if submitted:
             time.sleep(3)
             _log("[포스팅] ✔ 포스팅 완료!")
-            return True
+            return (True, None)
         else:
             _log("[포스팅] ✘ 등록 버튼을 찾을 수 없습니다.")
-            return False
+            return (False, "button_not_found")
 
     except Exception as e:
         _log(f"[포스팅] ✘ 글 작성 중 오류: {e}")
-        return False
+        return (False, "exception")
     finally:
         for p in temp_paths:
             try:
@@ -1372,6 +1390,9 @@ def run_auto_posting(
     category="건강식품",
     commission_image_folder=None,
     program_username=None,
+    keep_driver_open=False,
+    comm_mode=False,
+    start_cafe_idx=0,
 ):
     """
     전체 자동 포스팅 파이프라인 (유료회원/본인/추천인 교차 발행):
@@ -1499,14 +1520,36 @@ def run_auto_posting(
     total = len(tasks)
 
     def _cleanup():
-        """브라우저 정리 (정상 종료 및 중지 모두에서 호출)"""
+        """브라우저 정리 (정상 종료 및 중지 모두에서 호출). keep_driver_open이면 스킵."""
         nonlocal driver
+        if keep_driver_open and comm_mode:
+            _log("[정리] 통신모드 — 크롬 창 유지")
+            return
         if driver:
             safe_quit_driver(driver)
             driver = None
             if driver_holder is not None:
                 driver_holder["driver"] = None
             _log("[정리] 크롬 브라우저 종료 완료")
+
+    def _is_driver_alive(d):
+        try:
+            _ = d.current_url
+            return True
+        except Exception:
+            return False
+
+    def _needs_naver_login(drv):
+        """재사용 시 네이버 로그인 필요 여부 확인"""
+        try:
+            drv.get("https://section.cafe.naver.com")
+            time.sleep(2)
+            url = drv.current_url
+            return "nidlogin" in url or "nid.naver.com" in url
+        except Exception:
+            return True
+
+    last_posting_url = None
 
     _log("=" * 55)
     _log("  네이버 카페 자동 포스팅 시작")
@@ -1519,33 +1562,55 @@ def run_auto_posting(
     _log("=" * 55)
 
     # 1. 브라우저 준비 & 로그인
-    _log("\n[Step 1] 브라우저 준비 중...")
-    try:
-        driver = setup_driver()
-        if driver_holder is not None:
-            driver_holder["driver"] = driver
-        _log("[Step 1] ✔ 크롬 브라우저 준비 완료")
-    except Exception as e:
-        _log(f"[Step 1] ✘ 브라우저 준비 실패: {e}")
-        return {"success": 0, "fail": total, "total": total}
+    need_login = True
+    if comm_mode and driver_holder and driver_holder.get("driver"):
+        existing = driver_holder["driver"]
+        if _is_driver_alive(existing):
+            driver = existing
+            _log("[Step 1] ✔ 기존 크롬 브라우저 재사용")
+            need_login = False
+        else:
+            driver_holder["driver"] = None
+    if driver is None:
+        _log("\n[Step 1] 브라우저 준비 중...")
+        try:
+            driver = setup_driver()
+            if driver_holder is not None:
+                driver_holder["driver"] = driver
+            _log("[Step 1] ✔ 크롬 브라우저 준비 완료")
+        except Exception as e:
+            _log(f"[Step 1] ✘ 브라우저 준비 실패: {e}")
+            return {"success": 0, "fail": total, "total": total}
 
     if _stop():
         _log("\n[중지] 사용자가 작업을 중지했습니다.")
         _cleanup()
         return {"success": 0, "fail": total, "total": total}
 
-    _log("\n[Step 2] 네이버 로그인 중...")
-    if not login_to_naver(driver, login_id, password, log=_log):
-        _log("[Step 2] ✘ 로그인 실패. 작업을 중단합니다.")
-        _cleanup()
-        return {"success": 0, "fail": total, "total": total}
-
-    _log("[Step 2] ✔ 로그인 성공")
+    if need_login:
+        _log("\n[Step 2] 네이버 로그인 중...")
+        if not login_to_naver(driver, login_id, password, log=_log):
+            _log("[Step 2] ✘ 로그인 실패. 작업을 중단합니다.")
+            _cleanup()
+            return {"success": 0, "fail": total, "total": total}
+        _log("[Step 2] ✔ 로그인 성공")
+    else:
+        if _needs_naver_login(driver):
+            _log("\n[Step 2] 로그인 만료 감지 — 네이버 로그인 중...")
+            if not login_to_naver(driver, login_id, password, log=_log):
+                _log("[Step 2] ✘ 로그인 실패. 작업을 중단합니다.")
+                _cleanup()
+                return {"success": 0, "fail": total, "total": total}
+            _log("[Step 2] ✔ 로그인 성공")
+        else:
+            _log("[Step 2] ✔ 로그인 유지 (재사용)")
 
     # 2. 작업별 → 카페별 포스팅 (유료회원/본인 교차)
     count = 0
+    cafe_use_count = 0  # 실제로 카페에 쓴 횟수 (다음 실행 시 start_cafe_idx용)
     stopped = False
-    last_output_file = None  # SaaS 에이전트 모드용 result_url
+    last_output_file = None  # result_url 반환용
+    last_cafe_fail_reason = None  # member_required, button_not_found, exception
 
     for task_idx, task in enumerate(tasks):
         if _stop():
@@ -1648,8 +1713,9 @@ def run_auto_posting(
         _log(f"[Step 3] ✔ [{type_label}] 게시글 준비 완료 (제목: {title[:40]}...)")
         _log(f"[Step 3] 📸 상품별 이미지: {len(ordered_images)}개 매핑됨")
 
-        # 작업당 카페 1개: 작업 순서대로 카페에 라운드로빈 배정
-        cafe_idx = task_idx % len(cafes)
+        # 작업당 카페 1개: start_cafe_idx부터 순차 배정 (이전 작업 이어서)
+        cafe_idx = (start_cafe_idx + cafe_use_count) % len(cafes)
+        cafe_use_count += 1
         cafe = cafes[cafe_idx]
         cafe_id = cafe["cafe_id"]
         menu_id = cafe["menu_id"]
@@ -1661,16 +1727,24 @@ def run_auto_posting(
         count += 1
         _log(f"\n  ── [{count}/{total}] [{type_label}] 카페 {cafe_id}, 메뉴 {menu_id} ──")
 
-        ok = write_cafe_post(
+        wr = write_cafe_post(
             driver, cafe_id, menu_id,
             title, body,
             image_map=ordered_images,
             keyword=keyword,
             log=_log,
         )
+        ok = wr[0] if isinstance(wr, (tuple, list)) else bool(wr)
+        fail_reason = wr[1] if isinstance(wr, (tuple, list)) and len(wr) > 1 else None
 
         if ok:
-            _log(f"  ✔ [{type_label}] 포스팅 완료 — 댓글 작성 시작...")
+            # 글 작성 직후 URL 캡처 (댓글 작성 전 — write_comment가 페이지 변경할 수 있음)
+            posting_url = driver.current_url if driver else None
+            if posting_url:
+                last_posting_url = posting_url
+                _log(f"  ✔ [{type_label}] 포스팅 완료 — URL 캡처: {posting_url[:60]}...")
+            else:
+                _log(f"  ✔ [{type_label}] 포스팅 완료 — URL 캡처 실패 (current_url 없음)")
             comment_ok = write_comment(driver, products, log=_log)
             if comment_ok:
                 _log(f"  ✔ [{type_label}] 댓글(구매링크) 작성 완료")
@@ -1679,7 +1753,6 @@ def run_auto_posting(
             success += 1
             # post_logs 테이블에 기록
             try:
-                posting_url = driver.current_url if driver else None
                 if program_username:
                     pt = "self" if task_type == "own" else ("paid" if task_type == "paid" else "referrer")
                     partner_id = None
@@ -1707,6 +1780,7 @@ def run_auto_posting(
                 _log(f"  ⚠ [post_logs] 기록 실패 (무시): {e}")
         else:
             fail += 1
+            last_cafe_fail_reason = fail_reason
 
         # 연속 포스팅 간 대기 (랜덤)
         is_last = (task_idx == len(tasks) - 1)
@@ -1751,7 +1825,9 @@ def run_auto_posting(
         _log(f"{'=' * 55}")
 
     _cleanup()
-    return {"success": success, "fail": fail, "total": total, "output_file": last_output_file}
+    # 다음 실행 시 사용할 카페 인덱스 (이번에 카페에 쓴 횟수만큼 진행)
+    next_cafe_idx = (start_cafe_idx + cafe_use_count) % len(cafes) if cafes else 0
+    return {"success": success, "fail": fail, "total": total, "output_file": last_output_file, "published_url": last_posting_url, "next_cafe_idx": next_cafe_idx, "last_cafe_fail_reason": last_cafe_fail_reason}
 
 
 def _strip_part_markers(text):

@@ -1,0 +1,6 @@
+{
+  "PROJECT": "main-production",
+  "SUPABASE_URL": "https://xxxx.supabase.co",
+  "SUPABASE_ANON_KEY": "xxxx",
+  "SUPABASE_SERVICE_ROLE_KEY": ""
+}
