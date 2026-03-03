@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
 import { useRouter } from "next/navigation";
-import { Rocket, Wallet, CheckCircle, Clock, XCircle, FileText } from "lucide-react";
+import { Wallet, CheckCircle, Clock, XCircle, FileText } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -80,10 +80,6 @@ export default function DashboardPage() {
   const [todayTarget, setTodayTarget] = useState<number>(0);
   const [remainingTotal, setRemainingTotal] = useState<number>(0);
 
-  const [accessKey, setAccessKey] = useState("");
-  const [secretKey, setSecretKey] = useState("");
-  const [keyMsg, setKeyMsg] = useState("");
-
   const [keywordInput, setKeywordInput] = useState("");
   const [kwMsg, setKwMsg] = useState("");
 
@@ -97,9 +93,6 @@ export default function DashboardPage() {
   const [kwLoading, setKwLoading] = useState(false);
 
   const [appSettings, setAppSettings] = useState<{ global_post_cost?: number }>({});
-
-  const [enqueueLoading, setEnqueueLoading] = useState(false);
-  const [enqueueMsg, setEnqueueMsg] = useState<string>("");
 
   const [postTasks, setPostTasks] = useState<
     { id: string; keyword: string; status: string; created_at: string; updated_at: string | null; published_url: string | null; assigned_vm_name: string | null }[]
@@ -290,8 +283,6 @@ export default function DashboardPage() {
     setPhoneInput(profileRow.phone ?? "");
     setPlanDaily(Number(profileRow.daily_post_limit ?? 0));
     setPlanTotal(Number(profileRow.total_post_limit ?? 0));
-    setAccessKey(profileRow.coupang_access_key ?? "");
-    setSecretKey(profileRow.coupang_secret_key ?? "");
 
     // 잔액 RPC
     const { data: bal, error: bErr } = await supabase.rpc("get_wallet_balance");
@@ -409,24 +400,6 @@ export default function DashboardPage() {
     loadAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  const saveCoupangKeys = async () => {
-    setKeyMsg("");
-    if (!profile) return;
-
-    const { error } = await supabase
-      .from("profiles")
-      .update({
-        coupang_access_key: accessKey.trim(),
-        coupang_secret_key: secretKey.trim(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq("user_id", profile.user_id);
-
-    if (error) return setKeyMsg("❌ 저장 실패: " + error.message);
-    setKeyMsg("✅ 쿠팡 키 저장 완료!");
-    await loadAll();
-  };
 
   const addKeywords = async (keywords: string[]) => {
     const { data, error } = await supabase.rpc("add_user_keywords_limited", {
@@ -554,63 +527,6 @@ export default function DashboardPage() {
     router.push("/login");
   };
 
-  const startEnqueue = async () => {
-    setEnqueueMsg("");
-    if (!profile) return;
-
-    const ak = (profile.coupang_access_key ?? "").toString().trim();
-    const sk = (profile.coupang_secret_key ?? "").toString().trim();
-    if (!ak || !sk) {
-      setEnqueueMsg("❌ 쿠팡파트너스 키를 등록후 진행하세요.");
-      return;
-    }
-
-    const dailyLimit = Number(profile.daily_post_limit ?? 0);
-    if (dailyLimit <= 0) {
-      setEnqueueMsg("❌ 하루 발행 개수를 먼저 설정해주세요.");
-      return;
-    }
-
-    const { data: userData } = await supabase.auth.getUser();
-    if (!userData.user) {
-      setEnqueueMsg("❌ 로그인 정보가 없습니다.");
-      return;
-    }
-
-    const userId = profile.user_id ?? userData.user.id;
-    const costVal = Number(profile?.cost_per_post ?? appSettings?.global_post_cost ?? 70);
-
-    setEnqueueLoading(true);
-    try {
-      const { data, error } = await supabase.rpc("enqueue_post_tasks_paid", {
-        p_user_id: userId,
-        p_channel: "cafe",
-        p_count: dailyLimit,
-        p_cost: costVal,
-        p_payload: { meta: {} },
-      });
-
-      if (error) {
-        setEnqueueMsg("❌ 발행시작 실패: " + error.message);
-        return;
-      }
-
-      const inserted = Number((data as { inserted?: number })?.inserted ?? 0);
-      const msg = (data as { message?: string })?.message ?? "";
-      if (inserted === 0 && msg) {
-        setEnqueueMsg("❌ " + msg);
-        return;
-      }
-
-      setEnqueueMsg(`✅ 발행시작 완료! ${inserted}개 작업이 post_tasks에 등록되었습니다.`);
-      await loadAll();
-    } catch (err: unknown) {
-      setEnqueueMsg("❌ 오류: " + (err instanceof Error ? err.message : String(err)));
-    } finally {
-      setEnqueueLoading(false);
-    }
-  };
-
   if (!profile) {
     return (
       <div className="space-y-6 p-6">
@@ -641,45 +557,6 @@ export default function DashboardPage() {
 
   return (
     <div className="space-y-6 p-6">
-      {/* Hero */}
-      <Card className="rounded-2xl border shadow-sm overflow-hidden">
-        <div className="flex flex-col gap-6 p-6 md:flex-row md:items-center md:justify-between">
-          <div>
-            <h1 className="text-2xl font-bold text-zinc-900 dark:text-zinc-50">
-              쿠팡파트너스 자동포스팅
-            </h1>
-            <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-              70원부터, 워커가 자동 발행
-            </p>
-            <div className="mt-4 flex flex-wrap gap-4 text-xs text-zinc-600 dark:text-zinc-400">
-              <span>오늘 남은 발행량: {todayTarget}개</span>
-              <span>전체 남은 발행량: {remainingTotal}개</span>
-            </div>
-          </div>
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-            <Button
-              size="lg"
-              disabled={enqueueLoading || Number(profile?.daily_post_limit ?? 0) <= 0}
-              onClick={startEnqueue}
-              className="bg-emerald-600 hover:bg-emerald-700"
-            >
-              <Rocket className="size-5" />
-              {enqueueLoading ? "등록 중..." : "발행 시작"}
-            </Button>
-          </div>
-        </div>
-        {enqueueMsg && (
-          <div
-            className={cn(
-              "border-t px-6 py-2 text-sm font-medium",
-              enqueueMsg.startsWith("✅") ? "text-green-600" : "text-red-600"
-            )}
-          >
-            {enqueueMsg}
-          </div>
-        )}
-      </Card>
-
       {/* KPI 4 cards */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <Card className="rounded-2xl border shadow-sm">
@@ -767,8 +644,8 @@ export default function DashboardPage() {
             <EmptyState
               icon={FileText}
               title="아직 작업이 없어요"
-              description="발행 시작 버튼을 눌러 작업을 등록해보세요."
-              action={{ label: "발행 시작", onClick: startEnqueue }}
+              description="발행계획 메뉴에서 발행 시작 버튼을 눌러 작업을 등록해보세요."
+              action={{ label: "발행계획으로 이동", onClick: () => router.push("/plan") }}
             />
           ) : (
             <>
@@ -1024,7 +901,9 @@ export default function DashboardPage() {
             {" "}→ 필요한 예산: <b>{neededBudget.toLocaleString()}</b>원
           </div>
           <div className="text-xs text-gray-500">
+            <span className="inline-block rounded-lg border border-emerald-200 bg-emerald-50/90 px-3 py-2 text-sm font-medium text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200">
             * 전체 발행 개수만큼 발행이 끝날 때까지, 매일 "하루 발행 개수"만큼 진행됩니다.
+          </span>
           </div>
         </div>
 
@@ -1060,38 +939,8 @@ export default function DashboardPage() {
       </div>
 
       <div className="border rounded-xl p-4 space-y-3">
-        <div className="font-bold">쿠팡파트너스 키 설정</div>
-        <div className="grid gap-3 sm:grid-cols-2">
-          <div>
-            <label className="block text-sm font-medium text-gray-600 mb-1">Access Key 등록</label>
-            <input
-              className="border rounded-lg p-2 w-full"
-              value={accessKey}
-              onChange={(e) => setAccessKey(e.target.value)}
-              placeholder="Access Key 입력"
-            />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-600 mb-1">Secret Key 등록</label>
-            <input
-              className="border rounded-lg p-2 w-full"
-              value={secretKey}
-              onChange={(e) => setSecretKey(e.target.value)}
-              placeholder="Secret Key 입력"
-            />
-          </div>
-        </div>
-        <div className="flex gap-2 items-center">
-          <button className="border rounded-lg px-3 py-2" onClick={saveCoupangKeys}>
-            저장
-          </button>
-        </div>
-        {keyMsg && <div className="text-sm mt-2">{keyMsg}</div>}
-      </div>
-
-      <div className="border rounded-xl p-4 space-y-3">
         <div className="font-bold">키워드 등록</div>
-        <div className="text-xs text-gray-500">* 키워드는 아이디당 최대 1,000개까지 등록됩니다.</div>
+        <div className="text-xs text-gray-500">* 최대 1,000개까지 등록가능합니다.</div>
 
         <div className="flex gap-2 items-center">
           <input
@@ -1206,13 +1055,13 @@ export default function DashboardPage() {
                 const remaining = Math.max(0, MAX - currentCount);
 
                 if (remaining <= 0) {
-                  alert("키워드는 아이디당 최대 1000개까지 등록됩니다. 더 이상 등록할 수 없습니다.");
+                  alert("최대 1,000개까지 등록가능합니다. 더 이상 등록할 수 없습니다.");
                   return;
                 }
 
                 let kws = [...bulkKeywords];
                 if (kws.length > remaining) {
-                  alert(`키워드는 아이디당 최대 1000개까지 등록됩니다.\n이번에는 ${remaining}개까지만 등록됩니다.`);
+                  alert(`최대 1,000개까지 등록가능합니다.\n이번에는 ${remaining}개까지만 등록됩니다.`);
                   kws = kws.slice(0, remaining);
                 }
 
@@ -1287,7 +1136,7 @@ export default function DashboardPage() {
             className="border rounded-lg p-2 flex-1"
             value={kwSearch}
             onChange={(e) => setKwSearch(e.target.value)}
-            placeholder="검색어 입력 (예: 강남, 계란방석...)"
+            placeholder="검색어 입력 (예: 로지텍마우스, 계란방석...)"
           />
           <button className="border rounded-lg px-3 py-2" onClick={loadKeywords}>
             새로고침
