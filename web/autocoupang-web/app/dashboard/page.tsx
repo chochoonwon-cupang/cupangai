@@ -3,26 +3,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
 import { useRouter } from "next/navigation";
-import { Wallet, CheckCircle, Clock, XCircle, FileText } from "lucide-react";
+import { CheckCircle, Clock, XCircle } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { StatusBadge } from "@/lib/ui/status";
-import { EmptyState } from "@/components/common/EmptyState";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 
@@ -64,7 +48,6 @@ export default function DashboardPage() {
 
   const [phoneInput, setPhoneInput] = useState("");
   const [refCodeInput, setRefCodeInput] = useState("");
-  const [chargeAmount, setChargeAmount] = useState<number>(1000);
 
   const [referredCount, setReferredCount] = useState<number>(0);
   const [referrerBonusTotal, setReferrerBonusTotal] = useState<number>(0);
@@ -98,21 +81,6 @@ export default function DashboardPage() {
     { id: string; keyword: string; status: string; created_at: string; updated_at: string | null; published_url: string | null; assigned_vm_name: string | null }[]
   >([]);
   const [postTasksLoading, setPostTasksLoading] = useState(false);
-  const [postTasksPage, setPostTasksPage] = useState(1);
-  const [postTasksSortKey, setPostTasksSortKey] = useState<"keyword" | "status" | "assigned_vm_name" | "created_at" | "updated_at" | "published_url">("created_at");
-  const [postTasksSortAsc, setPostTasksSortAsc] = useState(false);
-  const [postTasksStatusFilter, setPostTasksStatusFilter] = useState<string>("all");
-  const [postTasksKeywordSearch, setPostTasksKeywordSearch] = useState("");
-  const [selectedTask, setSelectedTask] = useState<{
-    id: string;
-    keyword: string;
-    status: string;
-    created_at: string;
-    updated_at: string | null;
-    published_url: string | null;
-    assigned_vm_name: string | null;
-  } | null>(null);
-  const POST_TASKS_PER_PAGE = 10;
 
   const canSetReferrer = useMemo(() => {
     if (!profile) return false;
@@ -125,92 +93,17 @@ export default function DashboardPage() {
     return kwList.filter((k) => k.keyword.toLowerCase().includes(q));
   }, [kwList, kwSearch]);
 
-  const STATUS_ORDER: Record<string, number> = { pending: 0, assigned: 1, done: 2, failed: 3 };
-  const postTasksFiltered = useMemo(() => {
-    let arr = postTasks;
-    if (postTasksStatusFilter !== "all") {
-      arr = arr.filter((t) => t.status === postTasksStatusFilter);
-    }
-    if (postTasksKeywordSearch.trim()) {
-      const q = postTasksKeywordSearch.trim().toLowerCase();
-      arr = arr.filter((t) => (t.keyword || "").toLowerCase().includes(q));
-    }
-    return arr;
-  }, [postTasks, postTasksStatusFilter, postTasksKeywordSearch]);
-  const postTasksSorted = useMemo(() => {
-    const arr = [...postTasksFiltered];
-    const key = postTasksSortKey;
-    const asc = postTasksSortAsc;
-    arr.sort((a, b) => {
-      if (key === "keyword") {
-        const sa = a.keyword || "";
-        const sb = b.keyword || "";
-        return asc ? sa.localeCompare(sb, "ko") : sb.localeCompare(sa, "ko");
-      }
-      if (key === "status") {
-        const va = STATUS_ORDER[a.status] ?? 99;
-        const vb = STATUS_ORDER[b.status] ?? 99;
-        return asc ? va - vb : vb - va;
-      }
-      if (key === "assigned_vm_name") {
-        const sa = a.assigned_vm_name || "";
-        const sb = b.assigned_vm_name || "";
-        return asc ? sa.localeCompare(sb, "ko") : sb.localeCompare(sa, "ko");
-      }
-      if (key === "created_at") {
-        const da = new Date(a.created_at).getTime();
-        const db = new Date(b.created_at).getTime();
-        return asc ? da - db : db - da;
-      }
-      if (key === "updated_at") {
-        const da = a.updated_at ? new Date(a.updated_at).getTime() : 0;
-        const db = b.updated_at ? new Date(b.updated_at).getTime() : 0;
-        return asc ? da - db : db - da;
-      }
-      if (key === "published_url") {
-        const ha = a.published_url ? 1 : 0;
-        const hb = b.published_url ? 1 : 0;
-        return asc ? ha - hb : hb - ha;
-      }
-      return 0;
-    });
-    return arr;
-  }, [postTasks, postTasksSortKey, postTasksSortAsc]);
-
-  const postTasksTotalPages = useMemo(
-    () => Math.max(1, Math.ceil(postTasksFiltered.length / POST_TASKS_PER_PAGE)),
-    [postTasksFiltered.length]
-  );
-  const postTasksPaginated = useMemo(() => {
-    const start = (postTasksPage - 1) * POST_TASKS_PER_PAGE;
-    return postTasksSorted.slice(start, start + POST_TASKS_PER_PAGE);
-  }, [postTasksSorted, postTasksPage]);
-
-  const handlePostTasksSort = (key: typeof postTasksSortKey) => {
-    if (postTasksSortKey === key) {
-      setPostTasksSortAsc((prev) => !prev);
-    } else {
-      setPostTasksSortKey(key);
-      setPostTasksSortAsc(key === "created_at" ? false : true); // 등록일은 기본 최신순
-    }
-    setPostTasksPage(1);
-  };
-
-  useEffect(() => {
-    if (postTasksPage > postTasksTotalPages) setPostTasksPage(1);
-  }, [postTasksPage, postTasksTotalPages]);
-
   const posted = Number(profile?.total_posts_count ?? 0);
   const cost = Number(profile?.cost_per_post ?? appSettings?.global_post_cost ?? 70);
   const todayDoneCount = useMemo(() => {
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
-    return postTasks.filter(
-      (t) => t.status === "done" && t.updated_at && new Date(t.updated_at) >= todayStart
+    return (postTasks ?? []).filter(
+      (t) => t && t.status === "done" && t.updated_at && new Date(t.updated_at) >= todayStart
     ).length;
   }, [postTasks]);
-  const pendingCount = postTasks.filter((t) => t.status === "pending" || t.status === "assigned").length;
-  const failedCount = postTasks.filter((t) => t.status === "failed").length;
+  const pendingCount = (postTasks ?? []).filter((t) => t && (t.status === "pending" || t.status === "assigned")).length;
+  const failedCount = (postTasks ?? []).filter((t) => t && t.status === "failed").length;
   const remaining = Math.max(planTotal - posted, 0);
   const neededBudget = remaining * cost; // 앞으로 남은 발행분 전체 필요 예산
 
@@ -354,7 +247,6 @@ export default function DashboardPage() {
       return;
     }
     setPostTasks((data ?? []) as { id: string; keyword: string; status: string; created_at: string; updated_at: string | null; published_url: string | null; assigned_vm_name: string | null }[]);
-    setPostTasksPage(1);
   };
 
   const loadKeywords = async () => {
@@ -457,19 +349,6 @@ export default function DashboardPage() {
     await loadAll();
   };
 
-  const charge = async () => {
-    if (!chargeAmount || chargeAmount <= 0) return alert("충전 금액을 입력해줘.");
-
-    const { error } = await supabase.rpc("charge_wallet", {
-      p_amount: chargeAmount,
-    });
-
-    if (error) return alert("충전 실패: " + error.message);
-
-    alert("충전 완료 (테스트)");
-    await loadAll(); // balance + total_charged 갱신
-  };
-
   const savePlan = async () => {
     setPlanMsg("");
     setPlanErr("");
@@ -557,17 +436,8 @@ export default function DashboardPage() {
 
   return (
     <div className="space-y-6 p-6">
-      {/* KPI 4 cards */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-        <Card className="rounded-2xl border shadow-sm">
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
-            <CardTitle className="text-sm font-medium text-zinc-500">현재 잔액</CardTitle>
-            <Wallet className="size-4 text-zinc-400" />
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">{balance.toLocaleString()}원</div>
-          </CardContent>
-        </Card>
+      {/* KPI 3 cards (잔액/충전은 관리자 페이지로 이동) */}
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
         <Card className="rounded-2xl border shadow-sm">
           <CardHeader className="flex flex-row items-center justify-between pb-2">
             <CardTitle className="text-sm font-medium text-zinc-500">오늘 완료</CardTitle>
@@ -597,211 +467,6 @@ export default function DashboardPage() {
         </Card>
       </div>
 
-      {/* 작업 테이블 카드 */}
-      <Card className="rounded-2xl border shadow-sm">
-        <CardHeader className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <CardTitle>내 포스트 태스크</CardTitle>
-            <CardDescription>등록한 발행 작업 목록</CardDescription>
-          </div>
-          <Button variant="outline" size="default" onClick={loadPostTasks} disabled={postTasksLoading}>
-            {postTasksLoading ? "불러오는 중..." : "새로고침"}
-          </Button>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-            <Input
-              placeholder="키워드 검색"
-              value={postTasksKeywordSearch}
-              onChange={(e) => setPostTasksKeywordSearch(e.target.value)}
-              className="max-w-xs"
-            />
-            <div className="flex flex-wrap gap-1">
-              {[
-                { value: "all", label: "전체" },
-                { value: "pending", label: "대기" },
-                { value: "assigned", label: "진행" },
-                { value: "done", label: "완료" },
-                { value: "failed", label: "실패" },
-              ].map(({ value, label }) => (
-                <Button
-                  key={value}
-                  variant={postTasksStatusFilter === value ? "default" : "outline"}
-                  size="sm"
-                  onClick={() => {
-                    setPostTasksStatusFilter(value);
-                    setPostTasksPage(1);
-                  }}
-                >
-                  {label}
-                </Button>
-              ))}
-            </div>
-          </div>
-          {postTasksLoading ? (
-            <Skeleton className="h-64 w-full rounded-xl" />
-          ) : postTasks.length === 0 ? (
-            <EmptyState
-              icon={FileText}
-              title="아직 작업이 없어요"
-              description="발행계획 메뉴에서 발행 시작 버튼을 눌러 작업을 등록해보세요."
-              action={{ label: "발행계획으로 이동", onClick: () => router.push("/plan") }}
-            />
-          ) : (
-            <>
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead
-                      className="cursor-pointer hover:bg-zinc-100"
-                      onClick={() => handlePostTasksSort("keyword")}
-                    >
-                      키워드 {postTasksSortKey === "keyword" && (postTasksSortAsc ? "↑" : "↓")}
-                    </TableHead>
-                    <TableHead
-                      className="cursor-pointer hover:bg-zinc-100"
-                      onClick={() => handlePostTasksSort("status")}
-                    >
-                      현재작업상황 {postTasksSortKey === "status" && (postTasksSortAsc ? "↑" : "↓")}
-                    </TableHead>
-                    <TableHead
-                      className="cursor-pointer hover:bg-zinc-100"
-                      onClick={() => handlePostTasksSort("assigned_vm_name")}
-                    >
-                      담당VM {postTasksSortKey === "assigned_vm_name" && (postTasksSortAsc ? "↑" : "↓")}
-                    </TableHead>
-                    <TableHead
-                      className="cursor-pointer hover:bg-zinc-100"
-                      onClick={() => handlePostTasksSort("created_at")}
-                    >
-                      등록일 {postTasksSortKey === "created_at" && (postTasksSortAsc ? "↑" : "↓")}
-                    </TableHead>
-                    <TableHead
-                      className="cursor-pointer hover:bg-zinc-100"
-                      onClick={() => handlePostTasksSort("updated_at")}
-                    >
-                      작업완료시 {postTasksSortKey === "updated_at" && (postTasksSortAsc ? "↑" : "↓")}
-                    </TableHead>
-                    <TableHead
-                      className="cursor-pointer hover:bg-zinc-100"
-                      onClick={() => handlePostTasksSort("published_url")}
-                    >
-                      작업링크 {postTasksSortKey === "published_url" && (postTasksSortAsc ? "↑" : "↓")}
-                    </TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {postTasksPaginated.map((t) => (
-                    <TableRow
-                      key={t.id}
-                      className="cursor-pointer"
-                      onClick={() => setSelectedTask(t)}
-                    >
-                      <TableCell className="font-medium">{t.keyword || "-"}</TableCell>
-                      <TableCell>
-                        <StatusBadge status={t.status} />
-                      </TableCell>
-                      <TableCell className="text-zinc-600">{t.assigned_vm_name || "-"}</TableCell>
-                      <TableCell className="text-zinc-600">
-                        {new Date(t.created_at).toLocaleString("ko-KR")}
-                      </TableCell>
-                      <TableCell className="text-zinc-600">
-                        {(t.status === "done" || t.status === "failed") && t.updated_at
-                          ? new Date(t.updated_at).toLocaleString("ko-KR")
-                          : "-"}
-                      </TableCell>
-                      <TableCell>
-                        {t.published_url ? (
-                          <a
-                            href={t.published_url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-blue-600 hover:underline"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            링크
-                          </a>
-                        ) : (
-                          <span className="text-zinc-400">-</span>
-                        )}
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-              {postTasksFiltered.length > POST_TASKS_PER_PAGE && (
-                <div className="flex justify-center gap-1 pt-4">
-                  {Array.from({ length: postTasksTotalPages }, (_, i) => i + 1).map((p) => (
-                    <Button
-                      key={p}
-                      variant={p === postTasksPage ? "default" : "outline"}
-                      size="icon"
-                      onClick={() => setPostTasksPage(p)}
-                    >
-                      {p}
-                    </Button>
-                  ))}
-                </div>
-              )}
-            </>
-          )}
-        </CardContent>
-      </Card>
-
-      {/* 작업 상세 Dialog */}
-      <Dialog open={!!selectedTask} onOpenChange={(open) => !open && setSelectedTask(null)}>
-        <DialogContent showClose={true}>
-          {selectedTask && (
-            <>
-              <DialogHeader>
-                <DialogTitle>작업 상세</DialogTitle>
-              </DialogHeader>
-              <div className="space-y-4 text-sm">
-                <div>
-                  <span className="font-medium text-zinc-500">키워드</span>
-                  <p className="mt-1 font-medium">{selectedTask.keyword || "-"}</p>
-                </div>
-                <div>
-                  <span className="font-medium text-zinc-500">상태</span>
-                  <p className="mt-1">
-                    <StatusBadge status={selectedTask.status} />
-                  </p>
-                </div>
-                <div>
-                  <span className="font-medium text-zinc-500">담당 VM</span>
-                  <p className="mt-1">{selectedTask.assigned_vm_name || "-"}</p>
-                </div>
-                <div>
-                  <span className="font-medium text-zinc-500">등록일</span>
-                  <p className="mt-1">{new Date(selectedTask.created_at).toLocaleString("ko-KR")}</p>
-                </div>
-                {(selectedTask.status === "done" || selectedTask.status === "failed") && selectedTask.updated_at && (
-                  <div>
-                    <span className="font-medium text-zinc-500">작업완료시</span>
-                    <p className="mt-1">{new Date(selectedTask.updated_at).toLocaleString("ko-KR")}</p>
-                  </div>
-                )}
-                {selectedTask.published_url && (
-                  <div>
-                    <span className="font-medium text-zinc-500">작업 링크</span>
-                    <p className="mt-1">
-                      <a
-                        href={selectedTask.published_url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-blue-600 hover:underline break-all"
-                      >
-                        {selectedTask.published_url}
-                      </a>
-                    </p>
-                  </div>
-                )}
-              </div>
-            </>
-          )}
-        </DialogContent>
-      </Dialog>
-
       <Card className="rounded-2xl border shadow-sm">
         <CardHeader>
           <CardTitle className="text-base">요약</CardTitle>
@@ -827,7 +492,6 @@ export default function DashboardPage() {
         <div>전체 발행 제한: {totalLimit.toLocaleString()}개</div>
         <div>전체발행 완료 예정일(KST): {expectedEndDateText}</div>
         <div>누적 발행: {Number(profile?.total_posts_count ?? 0).toLocaleString()}개</div>
-        <div>현재 잔액 기준 총 발행가능: {possibleByBalance.toLocaleString()}개</div>
         <div className="text-xs text-gray-500">
           * 예정일은 "하루 발행 개수 × 전체 발행 개수" 기준의 계산값입니다. <br />
           * 작업량/예약/시간 지연으로 1~2일 오차가 생길 수 있으며, 당일 미발행분은 다음날로 이월될 수 있습니다.
@@ -837,35 +501,6 @@ export default function DashboardPage() {
           <div>내 추천인 수: {referredCount.toLocaleString()}명</div>
           <div>현재 추천 적립율: {effectiveReferralPercent}%</div>
           <div>추천 적립 누적: {referrerBonusTotal.toLocaleString()}원</div>
-        </div>
-        </CardContent>
-      </Card>
-
-      <Card className="rounded-2xl border shadow-sm">
-        <CardHeader>
-          <CardTitle>잔액</CardTitle>
-          <CardDescription>충전 및 사용 내역</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-        <div className="text-2xl font-bold">{balance.toLocaleString()}원</div>
-        <div className="text-sm text-zinc-500">누적 충전금액: {totalCharged.toLocaleString()}원</div>
-        <div className="text-sm text-zinc-600 space-y-1">
-          <div>추천 적립 누적: {referrerBonusTotal.toLocaleString()}원</div>
-          <div>관리자 보너스 충전 누적: {(profile?.admin_bonus_total ?? 0).toLocaleString()}원</div>
-        </div>
-        <div className="flex gap-2 items-center">
-          <Input
-            type="number"
-            value={chargeAmount}
-            onChange={(e) => setChargeAmount(Number(e.target.value) || 0)}
-            className="w-40"
-          />
-          <Button variant="outline" onClick={charge}>
-            테스트 충전
-          </Button>
-        </div>
-        <div className="text-xs text-zinc-500">
-          * 실제 결제 붙이기 전 테스트용 충전 버튼
         </div>
         </CardContent>
       </Card>

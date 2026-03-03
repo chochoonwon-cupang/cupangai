@@ -86,6 +86,14 @@ export default function AdminPage() {
   });
   const [naverIdSaving, setNaverIdSaving] = useState(false);
 
+  // 내 잔액/충전 (관리자 전용 — 일반 사용자 대시보드에서 이동)
+  const [myBalance, setMyBalance] = useState<number>(0);
+  const [myTotalCharged, setMyTotalCharged] = useState<number>(0);
+  const [myReferrerBonusTotal, setMyReferrerBonusTotal] = useState<number>(0);
+  const [myAdminBonusTotal, setMyAdminBonusTotal] = useState<number>(0);
+  const [myChargeAmount, setMyChargeAmount] = useState<number>(1000);
+  const [myBalanceLoading, setMyBalanceLoading] = useState(false);
+
   useEffect(() => {
     const init = async () => {
       const { data } = await supabase.auth.getUser();
@@ -102,6 +110,22 @@ export default function AdminPage() {
         return;
       }
       setIsAdmin(true);
+
+      // 내 잔액/충전 내역 로드 (관리자 본인)
+      setMyBalanceLoading(true);
+      try {
+        const { data: bal, error: bErr } = await supabase.rpc("get_wallet_balance");
+        if (!bErr) setMyBalance(Number(bal ?? 0));
+        const { data: prof } = await supabase.from("profiles").select("total_charged, admin_bonus_total").eq("user_id", data.user!.id).maybeSingle();
+        if (prof) {
+          setMyTotalCharged(Number(prof.total_charged ?? 0));
+          setMyAdminBonusTotal(Number(prof.admin_bonus_total ?? 0));
+        }
+        const { data: stats } = await supabase.rpc("get_referral_stats");
+        if (Array.isArray(stats) && stats[0]) setMyReferrerBonusTotal(Number(stats[0].total_referrer_bonus ?? 0));
+      } finally {
+        setMyBalanceLoading(false);
+      }
 
       // 전역 퍼센트 로드
       const { data: row } = await supabase
@@ -171,14 +195,14 @@ export default function AdminPage() {
 
   // 서버(VM) 목록: naver_id에서 distinct vm_name
   const naverIdVmList = useMemo(() => {
-    const set = new Set(naverIdList.map((r) => r.vm_name));
+    const set = new Set(naverIdList.filter((r) => r).map((r) => r.vm_name));
     return Array.from(set).sort();
   }, [naverIdList]);
 
   // 선택된 서버의 계정 목록
   const naverIdAccountList = useMemo(() => {
     if (!naverIdSelectedVm) return [];
-    return naverIdList.filter((r) => r.vm_name === naverIdSelectedVm);
+    return naverIdList.filter((r) => r && r.vm_name === naverIdSelectedVm);
   }, [naverIdList, naverIdSelectedVm]);
 
   useEffect(() => {
@@ -330,6 +354,22 @@ export default function AdminPage() {
       alert(e instanceof Error ? e.message : "보너스충전 실패");
     } finally {
       setBonusCharging(false);
+    }
+  };
+
+  const chargeMyWallet = async () => {
+    if (!myChargeAmount || myChargeAmount <= 0) return alert("충전 금액을 입력해주세요.");
+    setMyBalanceLoading(true);
+    try {
+      const { error } = await supabase.rpc("charge_wallet", { p_amount: myChargeAmount });
+      if (error) return alert("충전 실패: " + error.message);
+      alert("충전 완료 (테스트)");
+      const { data: bal } = await supabase.rpc("get_wallet_balance");
+      setMyBalance(Number(bal ?? 0));
+      const { data: prof } = await supabase.from("profiles").select("total_charged").eq("user_id", (await supabase.auth.getUser()).data.user?.id).maybeSingle();
+      if (prof) setMyTotalCharged(Number(prof.total_charged ?? 0));
+    } finally {
+      setMyBalanceLoading(false);
     }
   };
 
@@ -572,6 +612,40 @@ export default function AdminPage() {
         </div>
       ) : (
         <>
+      {/* 잔액 / 충전 및 사용 내역 (관리자 전용 — 일반 사용자 대시보드에서 이동) */}
+      <div className="border rounded-xl p-4 space-y-3 bg-slate-50">
+        <div className="font-bold">잔액</div>
+        <div className="text-sm text-zinc-600">충전 및 사용 내역</div>
+        {myBalanceLoading ? (
+          <div className="text-sm text-zinc-500">로딩중...</div>
+        ) : (
+          <>
+            <div className="text-2xl font-bold">{myBalance.toLocaleString()}원</div>
+            <div className="text-sm text-zinc-500">누적 충전금액: {myTotalCharged.toLocaleString()}원</div>
+            <div className="text-sm text-zinc-600 space-y-1">
+              <div>추천 적립 누적: {myReferrerBonusTotal.toLocaleString()}원</div>
+              <div>관리자 보너스 충전 누적: {myAdminBonusTotal.toLocaleString()}원</div>
+            </div>
+            <div className="flex gap-2 items-center">
+              <input
+                type="number"
+                className="border rounded-lg p-2 w-40"
+                value={myChargeAmount}
+                onChange={(e) => setMyChargeAmount(Number(e.target.value) || 0)}
+              />
+              <button
+                className="border rounded-lg px-3 py-2 bg-white hover:bg-gray-50 disabled:opacity-50"
+                onClick={chargeMyWallet}
+                disabled={myBalanceLoading}
+              >
+                테스트 충전
+              </button>
+            </div>
+            <div className="text-xs text-zinc-500">* 실제 결제 붙이기 전 테스트용 충전 버튼</div>
+          </>
+        )}
+      </div>
+
       {/* 사용자별 금액확인 */}
       <div className="border rounded-xl p-4 space-y-3 bg-slate-50">
         <div className="font-bold">사용자별 금액확인</div>
