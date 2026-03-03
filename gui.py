@@ -1793,7 +1793,22 @@ class App:
                     messagebox.showwarning("안내", "키워드를 먼저 '상품 검색' 탭에서 불러오세요.")
                     return
         multi = getattr(self, "blog_multi_account_var", None) and self.blog_multi_account_var.get()
-        if multi:
+        accounts = []
+        if is_task_run:
+            comm_vm_name = (getattr(self, "_comm_vm_name_var", None) and self._comm_vm_name_var.get() or "").strip() or _load_gui_vm_config().get("VM_NAME", "")
+            if comm_vm_name:
+                try:
+                    from shared.sb import fetch_naver_account_for_vm
+                    naver_acc = fetch_naver_account_for_vm(comm_vm_name, channel="blog", log=self._blog_log)
+                    if naver_acc:
+                        accounts = [naver_acc]
+                        self._blog_log(f"[통신] naver_id 테이블에서 블로그 계정 로드: {comm_vm_name} → {naver_acc.get('id', '')}")
+                except Exception as e:
+                    self._blog_log(f"[통신] naver_id 블로그 조회 실패: {e}")
+            if not accounts:
+                messagebox.showwarning("안내", "통신모드: 한도 남은 블로그 계정이 없습니다. 관리자 > 작업아이디설정에서 확인하세요.")
+                return
+        elif multi:
             path = getattr(self, "blog_multi_account_file_var", None) and self.blog_multi_account_file_var.get().strip()
             if not path or not os.path.isfile(path):
                 self._last_start_error = "다중아이디 파일 없음"
@@ -1946,6 +1961,13 @@ class App:
                 total_fail += fail
                 total_done += total
                 self.root.after(0, lambda s=success, f=fail, t=total: self._blog_log(f"\n완료: 성공 {s} / 실패 {f} / 총 {t}"))
+                if task_user_id and success > 0 and accounts and accounts[account_idx].get("row_id"):
+                    try:
+                        from shared.sb import increment_naver_account_usage
+                        increment_naver_account_usage(accounts[account_idx]["row_id"], "blog", count=success, log=self._blog_log)
+                        self._blog_log(f"[통신] 일일 블로그 발행 사용량 +{success}")
+                    except Exception as e:
+                        self._blog_log(f"[통신] 사용량 갱신 실패: {e}")
 
                 if getattr(self, "_blog_stop_flag", False):
                     break
@@ -3312,12 +3334,13 @@ class App:
                 if not claim_post_task_for_gui(task_id, task_user_id, vm_name=vm_name or None, log=self._log):
                     time.sleep(POLL_INTERVAL)
                     continue
+                self._comm_vm_name = vm_name or ""  # finish 시 잔액 차감용
                 self._log(f"[통신] task {task_id} 선점 — 키워드: {kw!r}" + (f" (VM: {vm_name})" if vm_name else ""))
                 self.append_log_global(f"[통신] 새 작업 발견 — 키워드 '{kw}'로 글 작성 시작")
                 self.root.after(0, lambda: self._run_task_posting(task_id, task_user_id, kw, channel))
                 time.sleep(3)
                 if not getattr(self, "is_posting", False):
-                    finish_post_task_for_gui(task_id, task_user_id, success=False, log=self._log)
+                    finish_post_task_for_gui(task_id, task_user_id, success=False, vm_name=getattr(self, "_comm_vm_name", ""), log=self._log)
                     self._log(f"[통신] task {task_id} — 포스팅 시작 실패 (카페/계정 설정 확인)")
                     time.sleep(POLL_INTERVAL)
                     continue
@@ -3332,7 +3355,7 @@ class App:
                 else:
                     self._log(f"[통신] task {task_id} published_url 없음 (success={success})")
                 if not already_success:
-                    finish_post_task_for_gui(task_id, task_user_id, success=success, published_url=published_url, log=self._log)
+                    finish_post_task_for_gui(task_id, task_user_id, success=success, published_url=published_url, vm_name=getattr(self, "_comm_vm_name", ""), log=self._log)
                 self._log(f"[통신] task {task_id} 완료 처리 (success={success})")
                 # 대기시간 설정만큼 대기 후 다음 폴링
                 imin = max(1, getattr(self, "cafe_interval_min_var", None) and self.cafe_interval_min_var.get() or 5)
@@ -3546,7 +3569,34 @@ class App:
                     return
                 keywords_for_posting = None
         multi = getattr(self, "cafe_multi_account_var", None) and self.cafe_multi_account_var.get()
-        if multi:
+        is_comm_mode = bool(task_keywords_override and getattr(self, "_comm_current_task_id", None))
+        accounts = []
+        # 통신모드: naver_id 테이블에서 VM별 계정 먼저 시도
+        if is_comm_mode:
+            comm_vm_name = (getattr(self, "_comm_vm_name_var", None) and self._comm_vm_name_var.get() or "").strip() or _load_gui_vm_config().get("VM_NAME", "")
+            if not comm_vm_name:
+                messagebox.showwarning("안내",
+                    "통신모드: VM 이름을 입력해주세요.\n\n"
+                    "통신 UI의 'VM:' 입력란에 관리자 > 작업아이디설정에 등록한 VM 이름(예: vm-001)을 입력하세요.\n"
+                    "configs/gui_vm.json에 VM_NAME을 설정해도 됩니다.")
+                return
+            try:
+                from shared.sb import fetch_naver_account_for_vm
+                naver_acc = fetch_naver_account_for_vm(comm_vm_name, channel="cafe", log=self._cafe_log)
+                if naver_acc:
+                    accounts = [naver_acc]
+                    self._cafe_log(f"[통신] naver_id 테이블에서 계정 로드: {comm_vm_name} → {naver_acc.get('id', '')}")
+                else:
+                    self._cafe_log(f"[통신] VM '{comm_vm_name}' — 사용중 계정 없거나 카페 한도 소진")
+                    messagebox.showwarning("안내",
+                        f"통신모드: VM '{comm_vm_name}'에 사용중 계정이 없거나 오늘 카페 발행 한도를 모두 사용했습니다.\n\n"
+                        "관리자 > 작업아이디설정에서 계정 등록·사용 설정 및 일일 한도를 확인하세요.")
+                    return
+            except Exception as e:
+                self._cafe_log(f"[통신] naver_id 조회 실패: {e}")
+                messagebox.showerror("오류", f"Supabase naver_id 조회 실패:\n{e}")
+                return
+        if not accounts and multi:
             path = getattr(self, "cafe_multi_account_file_var", None) and self.cafe_multi_account_file_var.get().strip()
             if not path or not os.path.isfile(path):
                 messagebox.showwarning("안내", "다중아이디 사용 시 아이디 파일을 불러오세요.")
@@ -3555,11 +3605,11 @@ class App:
             if not accounts:
                 messagebox.showwarning("안내", "유효한 계정이 없습니다. 형식: 아이디[TAB]비밀번호 (한 줄에 하나)")
                 return
-        else:
+        elif not accounts:
             nid = self.naver_id_var.get().strip()
             npw = self.naver_pw_var.get().strip()
             if not nid or not npw:
-                messagebox.showwarning("안내", "네이버 아이디와 비밀번호를 입력하세요.")
+                messagebox.showwarning("안내", "네이버 아이디와 비밀번호를 입력하세요. (또는 통신모드에서 VM 이름을 설정하고 관리자 > 작업아이디설정에 계정을 등록하세요)")
                 return
             accounts = [{"id": nid, "pw": npw}]
         gk = self.gemini_key_var.get().strip()
@@ -3662,7 +3712,16 @@ class App:
         self._cafe_log("[CAFE] worker started")
         import time
         from cafe_poster import run_auto_posting, setup_driver, login_to_naver
-        accounts = accounts or [{"id": self.naver_id_var.get().strip(), "pw": self.naver_pw_var.get().strip()}]
+        from shared.sb import fetch_naver_account_for_vm
+        # 통신모드: naver_id 테이블에서 VM별 계정 로드 (한도 남은 것 중 랜덤)
+        comm_vm_name = (getattr(self, "_comm_vm_name_var", None) and self._comm_vm_name_var.get() or "").strip() or _load_gui_vm_config().get("VM_NAME", "")
+        if task_id and comm_vm_name:
+            naver_acc = fetch_naver_account_for_vm(comm_vm_name, channel="cafe", log=self._cafe_log)
+            if naver_acc:
+                accounts = [naver_acc]
+                self._cafe_log(f"[통신] naver_id 테이블에서 계정 로드: {comm_vm_name} → {naver_acc.get('id', '')}")
+        if not accounts:
+            accounts = [{"id": self.naver_id_var.get().strip(), "pw": self.naver_pw_var.get().strip()}]
         keywords_to_use = (keywords_override if keywords_override is not None else self.keywords) or []
         gk = self.gemini_key_var.get().strip()
         sl = 1
@@ -3697,6 +3756,7 @@ class App:
                     self._cafe_log(f"[통신] 드라이버/로그인 오류: {e}")
                     self.is_posting = False
                     return
+            self._comm_last_account_id = comm_naver_id  # 계정 전환 시 재로그인용
 
         def _fetch_comm_cafes():
             """comm_mode_agent_cafe용: agent_cafe_lists에서 카페 1개 선택 (가입 필요 시 1개 가입 후)."""
@@ -3839,6 +3899,29 @@ class App:
                 if getattr(self, "_posting_stop_flag", False):
                     self._cafe_log("[중지] 사용자가 작업을 중지했습니다.")
                     break
+                # 통신모드 agent_cafe: 매 회차 한도 남은 계정 랜덤 선택 (없으면 종료)
+                if comm_mode_agent_cafe:
+                    comm_vm_name = (getattr(self, "_comm_vm_name_var", None) and self._comm_vm_name_var.get() or "").strip() or _load_gui_vm_config().get("VM_NAME", "")
+                    if comm_vm_name:
+                        naver_acc = fetch_naver_account_for_vm(comm_vm_name, channel="cafe", log=self._cafe_log)
+                        if not naver_acc:
+                            self._cafe_log("[통신] 한도 남은 계정 없음 — 오늘 작업 종료")
+                            break
+                        comm_naver_id = (naver_acc.get("id") or "").strip()
+                        comm_naver_pw = (naver_acc.get("pw") or "").strip()
+                        self._comm_current_row_id = naver_acc.get("row_id")
+                        if comm_naver_id != getattr(self, "_comm_last_account_id", ""):
+                            self._comm_last_account_id = comm_naver_id
+                            driver = driver_holder.get("driver")
+                            if driver:
+                                try:
+                                    if not login_to_naver(driver, comm_naver_id, comm_naver_pw, log=self._cafe_log):
+                                        self._cafe_log("[통신] 계정 전환 로그인 실패 — 스킵")
+                                        break
+                                    self._cafe_log(f"[통신] 계정 전환: {comm_naver_id}")
+                                except Exception as e:
+                                    self._cafe_log(f"[통신] 계정 전환 로그인 오류: {e}")
+                                    break
                 # 통신모드 agent_cafe: 2회차부터 새 태스크 claim → 다른 키워드 사용
                 if comm_mode_agent_cafe:
                     if _comm_cycle_count > 0:
@@ -3934,11 +4017,16 @@ class App:
                     if current_task_id and result.get("success", 0) > 0 and result.get("published_url"):
                         try:
                             from shared.gui_data import finish_post_task_for_gui
+                            from shared.sb import increment_naver_account_usage
                             pub_url = result.get("published_url", "").strip()
-                            finish_post_task_for_gui(current_task_id, current_task_user_id, success=True, published_url=pub_url, log=self._cafe_log)
+                            vm_name = getattr(self, "_comm_vm_name", "") or ""
+                            finish_post_task_for_gui(current_task_id, current_task_user_id, success=True, published_url=pub_url, vm_name=vm_name, log=self._cafe_log)
                             self._comm_last_published_url = pub_url
                             self._comm_task_finished_success = True
                             self._cafe_log(f"[통신] 글작성 직후 작업완료 등록 (URL 저장): {pub_url[:50]}...")
+                            if getattr(self, "_comm_current_row_id", None):
+                                increment_naver_account_usage(self._comm_current_row_id, "cafe", log=self._cafe_log)
+                                self._cafe_log("[통신] 일일 카페 발행 사용량 +1")
                         except Exception as e:
                             self._cafe_log(f"[통신] 즉시 완료 등록 실패: {e}")
 

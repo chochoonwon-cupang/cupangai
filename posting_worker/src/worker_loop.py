@@ -159,12 +159,12 @@ def execute_task(task: dict, vm_id: str, vm_name: str, log):
 
         if task_error:
             log(f"[Worker] error: {task_error}")
-            supabase_client.fail_task(vm_id, task_id, task_error, last_step="execute", log=log)
+            supabase_client.fail_task(vm_name, task_id, task_error, last_step="execute", log=log)
             return
 
         if result is None:
             log("[Worker] result is None — fail_task")
-            supabase_client.fail_task(vm_id, task_id, "result is None", last_step="execute", log=log)
+            supabase_client.fail_task(vm_name, task_id, "result is None", last_step="execute", log=log)
             return
 
         elapsed_ms = int((time.time() * 1000) - start_ms)
@@ -172,7 +172,7 @@ def execute_task(task: dict, vm_id: str, vm_name: str, log):
 
         if result.get("ok"):
             result_url = result.get("result_url", "") or "OK"
-            supabase_client.finish_task(vm_id, task_id, result_url, log=log)
+            supabase_client.finish_task(vm_name, task_id, result_url, log=log)
             log(f"[Worker] 작업 완료 task_id={task_id} result_url={result_url}")
         else:
             err = result.get("error", "unknown")
@@ -186,7 +186,7 @@ def execute_task(task: dict, vm_id: str, vm_name: str, log):
 
     except Exception as e:
         log(f"[Worker] error: {e}")
-        supabase_client.fail_task(vm_id, task_id, str(e), last_step="execute", log=log)
+        supabase_client.fail_task(vm_name, task_id, str(e), last_step="execute", log=log)
 
 
 def run_default_job(log):

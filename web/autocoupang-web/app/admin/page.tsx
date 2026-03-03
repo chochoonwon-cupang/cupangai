@@ -59,6 +59,33 @@ export default function AdminPage() {
   const [userBalanceSortAsc, setUserBalanceSortAsc] = useState(true);
   const [showUserSelectModal, setShowUserSelectModal] = useState(false);
 
+  // 탭: 관리자 설정 | 작업아이디설정
+  const [activeTab, setActiveTab] = useState<"admin" | "naver_id">("admin");
+
+  // 작업아이디설정 (naver_id) — 서버당 여러 계정, 아이디별 일일 한도
+  type NaverIdRow = {
+    id: string;
+    vm_name: string;
+    login_id: string;
+    password: string;
+    is_active: boolean;
+    daily_blog_limit?: number;
+    daily_cafe_limit?: number;
+  };
+  const [naverIdList, setNaverIdList] = useState<NaverIdRow[]>([]);
+  const [naverIdLoading, setNaverIdLoading] = useState(false);
+  const [naverIdSelectedVm, setNaverIdSelectedVm] = useState<string | null>(null);
+  const [naverIdSelected, setNaverIdSelected] = useState<NaverIdRow | null>(null);
+  const [naverIdForm, setNaverIdForm] = useState({
+    vm_name: "",
+    login_id: "",
+    password: "",
+    is_active: true,
+    daily_blog_limit: 0,
+    daily_cafe_limit: 0,
+  });
+  const [naverIdSaving, setNaverIdSaving] = useState(false);
+
   useEffect(() => {
     const init = async () => {
       const { data } = await supabase.auth.getUser();
@@ -125,6 +152,126 @@ export default function AdminPage() {
 
     init();
   }, [router]);
+
+  const loadNaverIdList = async (): Promise<NaverIdRow[]> => {
+    setNaverIdLoading(true);
+    try {
+      const { data, error } = await supabase.from("naver_id").select("id, vm_name, login_id, password, is_active, daily_blog_limit, daily_cafe_limit").order("vm_name");
+      if (error) throw error;
+      const rows = (data ?? []) as NaverIdRow[];
+      setNaverIdList(rows);
+      return rows;
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "naver_id 목록 조회 실패");
+      return [];
+    } finally {
+      setNaverIdLoading(false);
+    }
+  };
+
+  // 서버(VM) 목록: naver_id에서 distinct vm_name
+  const naverIdVmList = useMemo(() => {
+    const set = new Set(naverIdList.map((r) => r.vm_name));
+    return Array.from(set).sort();
+  }, [naverIdList]);
+
+  // 선택된 서버의 계정 목록
+  const naverIdAccountList = useMemo(() => {
+    if (!naverIdSelectedVm) return [];
+    return naverIdList.filter((r) => r.vm_name === naverIdSelectedVm);
+  }, [naverIdList, naverIdSelectedVm]);
+
+  useEffect(() => {
+    if (activeTab === "naver_id") loadNaverIdList();
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (naverIdSelected) {
+      setNaverIdForm({
+        vm_name: naverIdSelected.vm_name,
+        login_id: naverIdSelected.login_id,
+        password: naverIdSelected.password,
+        is_active: naverIdSelected.is_active ?? true,
+        daily_blog_limit: naverIdSelected.daily_blog_limit ?? 0,
+        daily_cafe_limit: naverIdSelected.daily_cafe_limit ?? 0,
+      });
+    } else {
+      setNaverIdForm({
+        vm_name: naverIdSelectedVm ?? "",
+        login_id: "",
+        password: "",
+        is_active: true,
+        daily_blog_limit: 0,
+        daily_cafe_limit: 0,
+      });
+    }
+  }, [naverIdSelected, naverIdSelectedVm]);
+
+  const saveNaverId = async () => {
+    const vm = naverIdForm.vm_name.trim();
+    if (!vm) return alert("VM 이름을 입력해주세요.");
+    if (!naverIdForm.login_id.trim()) return alert("네이버 아이디를 입력해주세요.");
+    if (!naverIdForm.password.trim()) return alert("비밀번호를 입력해주세요.");
+    setNaverIdSaving(true);
+    try {
+      const payload = {
+        vm_name: vm,
+        login_id: naverIdForm.login_id.trim(),
+        password: naverIdForm.password.trim(),
+        is_active: naverIdForm.is_active,
+        daily_blog_limit: Math.max(0, Number(naverIdForm.daily_blog_limit) || 0),
+        daily_cafe_limit: Math.max(0, Number(naverIdForm.daily_cafe_limit) || 0),
+        updated_at: new Date().toISOString(),
+      };
+      if (naverIdSelected) {
+        const { error } = await supabase.from("naver_id").update(payload).eq("id", naverIdSelected.id);
+        if (error) throw error;
+      } else {
+        const { error } = await supabase.from("naver_id").insert({
+          vm_name: payload.vm_name,
+          login_id: payload.login_id,
+          password: payload.password,
+          is_active: payload.is_active,
+          daily_blog_limit: payload.daily_blog_limit,
+          daily_cafe_limit: payload.daily_cafe_limit,
+        });
+        if (error) throw error;
+      }
+      alert("저장 완료");
+      const rows = await loadNaverIdList();
+      const saved = rows.find((r) => r.vm_name === vm && r.login_id === naverIdForm.login_id.trim());
+      if (saved) setNaverIdSelected(saved);
+      setNaverIdSelectedVm(vm);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "저장 실패");
+    } finally {
+      setNaverIdSaving(false);
+    }
+  };
+
+  const deleteNaverId = async () => {
+    if (!naverIdSelected) return alert("삭제할 항목을 선택해주세요.");
+    if (!confirm(`"${naverIdSelected.login_id}" 계정을 삭제하시겠습니까?`)) return;
+    try {
+      const { error } = await supabase.from("naver_id").delete().eq("id", naverIdSelected.id);
+      if (error) throw error;
+      alert("삭제 완료");
+      setNaverIdSelected(null);
+      await loadNaverIdList();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "삭제 실패");
+    }
+  };
+
+  const addNewNaverId = () => {
+    setNaverIdSelected(null);
+    setNaverIdForm({ vm_name: naverIdSelectedVm ?? "", login_id: "", password: "", is_active: true });
+  };
+
+  const selectNaverIdVm = (vm: string | null) => {
+    setNaverIdSelectedVm(vm);
+    setNaverIdSelected(null);
+  };
 
   const saveGlobalPercent = async () => {
     const { error } = await supabase.rpc("admin_set_referral_percent", {
@@ -255,9 +402,176 @@ export default function AdminPage() {
 
   return (
     <div className="p-8 space-y-6">
-      <h1 className="text-2xl font-bold">관리자 설정</h1>
+      <div className="flex items-center justify-between flex-wrap gap-4">
+        <h1 className="text-2xl font-bold">관리자</h1>
+        <div className="flex gap-2">
+          <button
+            className={`px-4 py-2 rounded-lg border ${activeTab === "admin" ? "bg-slate-100 border-slate-300 font-medium" : "bg-white hover:bg-gray-50"}`}
+            onClick={() => setActiveTab("admin")}
+          >
+            관리자 설정
+          </button>
+          <button
+            className={`px-4 py-2 rounded-lg border ${activeTab === "naver_id" ? "bg-slate-100 border-slate-300 font-medium" : "bg-white hover:bg-gray-50"}`}
+            onClick={() => setActiveTab("naver_id")}
+          >
+            작업아이디설정
+          </button>
+        </div>
+      </div>
       <div className="text-sm text-gray-600">로그인: {email}</div>
 
+      {activeTab === "naver_id" ? (
+        <div className="border rounded-xl p-4 space-y-4 bg-slate-50">
+          <div className="font-bold">작업아이디설정 — 서버당 여러 네이버 계정</div>
+          <div className="text-xs text-gray-600">
+            서버(VM)를 선택하면 해당 서버의 아이디 목록이 나옵니다. 아이디를 클릭해 저장/수정/삭제하세요. 사용으로 저장하면 해당 아이디만 작업에 사용됩니다.
+          </div>
+          <div className="flex gap-4 flex-wrap">
+            {/* 서버 목록 */}
+            <div className="w-48 shrink-0">
+              <div className="font-medium text-sm mb-2">서버 목록</div>
+              {naverIdLoading ? (
+                <div className="text-sm text-gray-500">로딩중...</div>
+              ) : (
+                <div className="border rounded-lg bg-white max-h-48 overflow-y-auto">
+                  {naverIdVmList.map((vm) => (
+                    <button
+                      key={vm}
+                      className={`block w-full text-left p-2 border-b last:border-b-0 hover:bg-gray-50 ${naverIdSelectedVm === vm ? "bg-blue-50 border-l-2 border-l-blue-500" : ""}`}
+                      onClick={() => selectNaverIdVm(vm)}
+                    >
+                      {vm}
+                    </button>
+                  ))}
+                  {naverIdVmList.length === 0 && !naverIdLoading && (
+                    <div className="p-3 text-center text-gray-500 text-sm">등록된 서버 없음</div>
+                  )}
+                </div>
+              )}
+              <button
+                className={`mt-2 text-sm hover:underline ${naverIdSelectedVm === null ? "text-blue-700 font-medium" : "text-blue-600"}`}
+                onClick={() => selectNaverIdVm(null)}
+              >
+                + 새 서버 추가
+              </button>
+            </div>
+            {/* 선택된 서버의 아이디 목록 */}
+            <div className="w-56 shrink-0">
+              <div className="font-medium text-sm mb-2">
+                {naverIdSelectedVm ? `${naverIdSelectedVm} 아이디` : "새 서버"}
+              </div>
+              {naverIdSelectedVm ? (
+                <div className="border rounded-lg bg-white max-h-48 overflow-y-auto">
+                  {naverIdAccountList.map((row) => (
+                    <button
+                      key={row.id}
+                      className={`block w-full text-left p-2 border-b last:border-b-0 hover:bg-gray-50 ${naverIdSelected?.id === row.id ? "bg-blue-50 border-l-2 border-l-blue-500" : ""}`}
+                      onClick={() => setNaverIdSelected(row)}
+                    >
+                      <span className="font-medium">{row.login_id}</span>
+                      <span className={`ml-2 text-xs ${row.is_active ? "text-green-600" : "text-gray-400"}`}>
+                        {row.is_active ? "사용" : "대기"}
+                      </span>
+                    </button>
+                  ))}
+                  {naverIdAccountList.length === 0 && (
+                    <div className="p-3 text-center text-gray-500 text-sm">아이디 없음</div>
+                  )}
+                </div>
+              ) : (
+                <div className="p-3 text-sm text-gray-500">서버 선택 또는 새 서버 추가 후 VM 이름과 아이디를 입력하세요.</div>
+              )}
+              {naverIdSelectedVm && (
+                <button className="mt-2 text-sm text-blue-600 hover:underline" onClick={addNewNaverId}>
+                  + 새 아이디 추가
+                </button>
+              )}
+            </div>
+            {/* 저장/수정 폼 */}
+            <div className="flex-1 min-w-[260px] space-y-3">
+              <div className="font-medium text-sm">계정 정보</div>
+              <div>
+                <label className="block text-xs text-gray-500 mb-1">VM 이름</label>
+                <input
+                  className="border rounded-lg p-2 w-full"
+                  placeholder="예: vm-001"
+                  value={naverIdForm.vm_name}
+                  onChange={(e) => setNaverIdForm((f) => ({ ...f, vm_name: e.target.value }))}
+                  readOnly={!!naverIdSelectedVm}
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-gray-500 mb-1">네이버 아이디</label>
+                <input
+                  className="border rounded-lg p-2 w-full"
+                  placeholder="네이버 로그인 아이디"
+                  value={naverIdForm.login_id}
+                  onChange={(e) => setNaverIdForm((f) => ({ ...f, login_id: e.target.value }))}
+                  readOnly={!!naverIdSelected}
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-gray-500 mb-1">비밀번호</label>
+                <input
+                  type="password"
+                  className="border rounded-lg p-2 w-full"
+                  placeholder="네이버 비밀번호"
+                  value={naverIdForm.password}
+                  onChange={(e) => setNaverIdForm((f) => ({ ...f, password: e.target.value }))}
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">하루 블로그 발행</label>
+                  <input
+                    type="number"
+                    min={0}
+                    className="border rounded-lg p-2 w-full"
+                    placeholder="0=무제한"
+                    value={naverIdForm.daily_blog_limit}
+                    onChange={(e) => setNaverIdForm((f) => ({ ...f, daily_blog_limit: Number(e.target.value) || 0 }))}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">하루 카페 발행</label>
+                  <input
+                    type="number"
+                    min={0}
+                    className="border rounded-lg p-2 w-full"
+                    placeholder="0=무제한"
+                    value={naverIdForm.daily_cafe_limit}
+                    onChange={(e) => setNaverIdForm((f) => ({ ...f, daily_cafe_limit: Number(e.target.value) || 0 }))}
+                  />
+                </div>
+              </div>
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={naverIdForm.is_active}
+                  onChange={(e) => setNaverIdForm((f) => ({ ...f, is_active: e.target.checked }))}
+                />
+                <span>사용 (체크 시 작업에 사용, 여러 아이디 동시 사용 가능. 한도 남은 아이디 중 랜덤 선택)</span>
+              </label>
+              <div className="flex gap-2">
+                <button
+                  className="border rounded-lg px-3 py-2 bg-white hover:bg-gray-50 disabled:opacity-50"
+                  onClick={saveNaverId}
+                  disabled={naverIdSaving}
+                >
+                  {naverIdSaving ? "저장중..." : "저장"}
+                </button>
+                {naverIdSelected && (
+                  <button className="border rounded-lg px-3 py-2 bg-red-50 hover:bg-red-100 text-red-700" onClick={deleteNaverId}>
+                    삭제
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <>
       {/* 사용자별 금액확인 */}
       <div className="border rounded-xl p-4 space-y-3 bg-slate-50">
         <div className="font-bold">사용자별 금액확인</div>
@@ -608,6 +922,8 @@ export default function AdminPage() {
           </>
         )}
       </div>
+        </>
+      )}
     </div>
   );
 }

@@ -147,6 +147,98 @@ def select(
         return []
 
 
+def fetch_naver_account_for_vm(vm_name: str, channel: str = "cafe", log=None):
+    """
+    naver_id 테이블에서 VM별 네이버 계정 로드 (통신모드용)
+    - is_active=true인 계정 중 일일 한도 남은 것 랜덤 선택
+    - channel: "cafe" | "blog" — 해당 채널의 daily_*_limit/used 확인
+    - Returns: {"id": str, "pw": str, "row_id": str} 또는 None (한도 남은 계정 없으면)
+    """
+    import random
+    from datetime import date, datetime, timezone
+
+    _log = log or (lambda m: None)
+    vm = (vm_name or "").strip()
+    if not vm:
+        return None
+    today = str(date.today())
+    try:
+        client = get_client(use_service_role=True)
+        try:
+            r = client.table("naver_id").select("id, login_id, password, daily_blog_limit, daily_cafe_limit, daily_blog_used, daily_cafe_used, usage_date").eq("vm_name", vm).eq("is_active", True).execute()
+        except Exception:
+            r = client.table("naver_id").select("id, login_id, password").eq("vm_name", vm).eq("is_active", True).execute()
+        rows = r.data or []
+        if not rows:
+            return None
+        # 한도 컬럼 없으면 무제한으로 처리
+        for row in rows:
+            if "daily_blog_limit" not in row:
+                row["daily_blog_limit"] = 0
+                row["daily_cafe_limit"] = 0
+                row["daily_blog_used"] = 0
+                row["daily_cafe_used"] = 0
+                row["usage_date"] = ""
+        # 날짜 바뀌면 used 초기화
+        for row in rows:
+            ud = (row.get("usage_date") or "")
+            if ud != today:
+                try:
+                    client.table("naver_id").update({
+                        "daily_blog_used": 0, "daily_cafe_used": 0, "usage_date": today,
+                        "updated_at": datetime.now(timezone.utc).isoformat()
+                    }).eq("id", row["id"]).execute()
+                    row["daily_blog_used"] = 0
+                    row["daily_cafe_used"] = 0
+                except Exception:
+                    row["daily_blog_used"] = 0
+                    row["daily_cafe_used"] = 0
+        # 한도 남은 계정만 필터 (0=무제한)
+        if channel == "blog":
+            candidates = [x for x in rows if (x.get("daily_blog_limit") or 0) == 0 or (x.get("daily_blog_used") or 0) < (x.get("daily_blog_limit") or 0)]
+        else:
+            candidates = [x for x in rows if (x.get("daily_cafe_limit") or 0) == 0 or (x.get("daily_cafe_used") or 0) < (x.get("daily_cafe_limit") or 0)]
+        if not candidates:
+            _log(f"[Supabase] naver_id {vm} — {channel} 한도 남은 계정 없음")
+            return None
+        row = random.choice(candidates)
+        lid = (row.get("login_id") or "").strip()
+        pw = (row.get("password") or "").strip()
+        if not lid:
+            return None
+        return {"id": lid, "pw": pw, "row_id": row["id"]}
+    except Exception as e:
+        _log(f"[Supabase] fetch_naver_account_for_vm({vm}) 실패: {e}")
+        return None
+
+
+def increment_naver_account_usage(row_id: str, channel: str = "cafe", count: int = 1, log=None):
+    """발행 성공 시 해당 계정의 일일 사용량 +count"""
+    from datetime import date, datetime, timezone
+
+    _log = log or (lambda m: None)
+    if not row_id or count < 1:
+        return
+    today = str(date.today())
+    try:
+        client = get_client(use_service_role=True)
+        r = client.table("naver_id").select("daily_blog_used, daily_cafe_used, usage_date").eq("id", row_id).single().execute()
+        row = r.data if r.data else {}
+        ud = (row.get("usage_date") or "")
+        blog_used = int(row.get("daily_blog_used") or 0) if ud == today else 0
+        cafe_used = int(row.get("daily_cafe_used") or 0) if ud == today else 0
+        if channel == "blog":
+            blog_used += count
+        else:
+            cafe_used += count
+        client.table("naver_id").update({
+            "daily_blog_used": blog_used, "daily_cafe_used": cafe_used,
+            "usage_date": today, "updated_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", row_id).execute()
+    except Exception as e:
+        _log(f"[Supabase] increment_naver_account_usage({row_id}) 실패: {e}")
+
+
 def fetch_vm_accounts(vm_name: str, log=None) -> list:
     """
     vm_accounts 테이블에서 VM별 네이버 계정 로드

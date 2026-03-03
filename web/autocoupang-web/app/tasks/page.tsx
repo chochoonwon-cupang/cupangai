@@ -236,8 +236,8 @@ export default function TasksPage() {
     <div className="space-y-6 p-6">
       <h1 className="text-xl font-bold text-zinc-900 dark:text-zinc-50">작업내역</h1>
 
-      {/* KPI 4개: 오늘완료, 대기중, 전체남은수량, 완료예상일 (잔액 없음) */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+      {/* KPI 4개: 오늘완료, 대기중, 전체남은수량, 완료예상일 - 모바일 2x2 */}
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4 lg:gap-4">
         <Card className="rounded-2xl border shadow-sm">
           <CardHeader className="flex flex-row items-center justify-between pb-2">
             <CardTitle className="text-sm font-medium text-zinc-500">오늘 완료</CardTitle>
@@ -292,14 +292,14 @@ export default function TasksPage() {
           </Button>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
             <Input
               placeholder="키워드 검색"
               value={postTasksKeywordSearch}
               onChange={(e) => setPostTasksKeywordSearch(e.target.value)}
-              className="max-w-xs"
+              className="w-full sm:max-w-xs"
             />
-            <div className="flex flex-wrap gap-1">
+            <div className="flex flex-wrap gap-1.5">
               {[
                 { value: "all", label: "전체" },
                 { value: "pending", label: "대기" },
@@ -329,6 +329,44 @@ export default function TasksPage() {
             />
           ) : (
             <>
+              {/* 모바일: 카드형 목록 */}
+              <div className="space-y-3 md:hidden">
+                {postTasksPaginated.map((t) => (
+                  <div
+                    key={t.id}
+                    onClick={() => setSelectedTask(t)}
+                    className="rounded-xl border border-zinc-200 bg-white p-4 shadow-sm active:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:active:bg-zinc-800"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <div className="font-medium truncate">{t.keyword || "-"}</div>
+                        <div className="mt-1 flex items-center gap-2">
+                          <StatusBadge status={t.status} />
+                          {(t.status === "done" || t.status === "failed") && t.updated_at && (
+                            <span className="text-xs text-zinc-500">
+                              {new Date(t.updated_at).toLocaleDateString("ko-KR")}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      {t.published_url && (
+                        <a
+                          href={t.published_url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="shrink-0 text-sm text-blue-600 hover:underline"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          링크
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* 데스크톱: 테이블 */}
+              <div className="hidden overflow-x-auto md:block">
               <Table>
                 <TableHeader>
                   <TableRow>
@@ -385,6 +423,7 @@ export default function TasksPage() {
                   ))}
                 </TableBody>
               </Table>
+              </div>
               {postTasksFiltered.length > POST_TASKS_PER_PAGE && (
                 <div className="flex justify-center gap-1 pt-4">
                   {Array.from({ length: postTasksTotalPages }, (_, i) => i + 1).map((p) => (

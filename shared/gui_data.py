@@ -489,13 +489,34 @@ def claim_post_task_for_gui(task_id, user_id, vm_name=None, log=None):
         return False
 
 
-def finish_post_task_for_gui(task_id, user_id, success=True, published_url=None, log=None):
-    """post_tasks 1건 완료 처리 (status → done/failed, published_url 저장)"""
+def finish_post_task_for_gui(task_id, user_id, success=True, published_url=None, vm_name=None, log=None):
+    """post_tasks 1건 완료 처리 (status → done/failed, published_url 저장). success=True이고 vm_name 있으면 finish_task RPC 호출 → 잔액 차감."""
     _log = log or (lambda m: None)
     if not task_id:
         return False
     status = "done" if success else "failed"
     try:
+        # success=True이면 finish_task RPC 호출 (잔액 차감). vm_name 없으면 태스크에서 조회
+        use_vm_name = (vm_name and str(vm_name).strip()) or ""
+        if success and not use_vm_name:
+            try:
+                client = get_client(use_service_role=True)
+                r = client.table("post_tasks").select("assigned_vm_name").eq("id", task_id).limit(1).execute()
+                if r.data and r.data[0].get("assigned_vm_name"):
+                    use_vm_name = str(r.data[0]["assigned_vm_name"]).strip()
+            except Exception:
+                pass
+        if success and use_vm_name:
+            from shared.sb import rpc
+            ok, _, err = rpc("finish_task", {
+                "p_vm_name": use_vm_name,
+                "p_task_id": task_id,
+                "p_result_url": (published_url or "").strip(),
+            }, use_service_role=True, log=_log)
+            if ok:
+                return True
+            _log(f"[GUI] finish_task RPC 실패, direct update 시도: {err[:100]}")
+        # RPC 실패 또는 vm_name 없음 → direct update (잔액 차감 없음)
         client = get_client(use_service_role=True)
         data = {"status": status, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
         if published_url and str(published_url).strip():

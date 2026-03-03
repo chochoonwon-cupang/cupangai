@@ -5,8 +5,8 @@
 # POST {SUPABASE_URL}/rest/v1/rpc/{function_name}
 # RPC 시그니처 고정:
 #   claim_task(p_vm_id uuid) -> setof post_tasks
-#   finish_task(p_vm_id uuid, p_task_id uuid, p_result_url text) -> void
-#   fail_task(p_vm_id uuid, p_task_id uuid, p_error text, p_last_step text) -> void
+#   finish_task(p_vm_name text, p_task_id uuid, p_result_url text) -> void
+#   fail_task(p_vm_name text, p_task_id uuid, p_error text, p_last_step text) -> void
 #   heartbeat_vm(p_vm_id uuid, p_vm_name text) -> void
 #   heartbeat_task(p_task_id uuid, p_vm_id uuid, p_extend_seconds int, p_vm_name text) -> void
 #   requeue_stuck_tasks(p_timeout_seconds int) -> int
@@ -123,11 +123,11 @@ def claim_task(vm_id: str, log=None):
     return None
 
 
-def finish_task(vm_id: str, task_id, result_url: str, log=None) -> bool:
-    """작업 완료 처리 (p_vm_id uuid, p_task_id uuid, p_result_url text)"""
+def finish_task(vm_name: str, task_id, result_url: str, log=None) -> bool:
+    """작업 완료 처리 (p_vm_name text, p_task_id uuid, p_result_url text) — assigned_vm_name으로 매칭"""
     _log = log or print
     payload = {
-        "p_vm_id": vm_id,
+        "p_vm_name": vm_name or "",
         "p_task_id": task_id,
         "p_result_url": result_url or "",
     }
@@ -138,13 +138,13 @@ def finish_task(vm_id: str, task_id, result_url: str, log=None) -> bool:
     return True
 
 
-def fail_task(vm_id: str, task_id, error_message: str, last_step: str = "", log=None) -> bool:
-    """작업 실패 처리 (p_vm_id uuid, p_task_id uuid, p_error text, p_last_step text)"""
+def fail_task(vm_name: str, task_id, error_message: str, last_step: str = "", log=None) -> bool:
+    """작업 실패 처리 (p_vm_name text, p_task_id uuid, p_error text, p_last_step text) — assigned_vm_name으로 매칭"""
     _log = log or print
     ok, _, err = _rpc(
         "fail_task",
         {
-            "p_vm_id": vm_id,
+            "p_vm_name": vm_name or "",
             "p_task_id": task_id,
             "p_error": error_message or "",
             "p_last_step": last_step or "",
