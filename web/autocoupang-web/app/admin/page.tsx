@@ -289,7 +289,7 @@ export default function AdminPage() {
 
   const addNewNaverId = () => {
     setNaverIdSelected(null);
-    setNaverIdForm({ vm_name: naverIdSelectedVm ?? "", login_id: "", password: "", is_active: true });
+    setNaverIdForm({ vm_name: naverIdSelectedVm ?? "", login_id: "", password: "", is_active: true, daily_blog_limit: 0, daily_cafe_limit: 0 });
   };
 
   const selectNaverIdVm = (vm: string | null) => {
