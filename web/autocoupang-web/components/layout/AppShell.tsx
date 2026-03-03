@@ -35,6 +35,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [mobileMenuOpen, setMobileMenuOpen] = React.useState(false);
   const [balance, setBalance] = React.useState(0);
   const [email, setEmail] = React.useState("");
+  const [isAdmin, setIsAdmin] = React.useState(false);
 
   React.useEffect(() => {
     const init = async () => {
@@ -43,6 +44,10 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         setEmail(data.user.email ?? "");
         const { data: bal } = await supabase.rpc("get_wallet_balance");
         setBalance(Number(bal ?? 0));
+        const { data: adminOk } = await supabase.rpc("is_admin");
+        setIsAdmin(!!adminOk);
+      } else {
+        setIsAdmin(false);
       }
     };
     init();
@@ -53,6 +58,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     await supabase.auth.signOut();
     router.push("/login");
   };
+
+  const visibleNavItems = React.useMemo(
+    () => (isAdmin ? navItems : navItems.filter((item) => item.href !== "/admin")),
+    [isAdmin]
+  );
 
   const isActive = (item: (typeof navItems)[0]) =>
     item.href === "/admin"
@@ -102,7 +112,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
         {/* 데스크톱: 상단 가로 메뉴 */}
         <nav className="hidden flex-1 items-center justify-center gap-0 lg:flex">
-          {navItems.map((item) => (
+          {visibleNavItems.map((item) => (
             <Link
               key={item.href + item.label}
               href={item.href}
@@ -155,7 +165,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </Button>
         </div>
         <nav className="flex flex-col gap-1 p-4">
-          {navItems.map((item) => (
+          {visibleNavItems.map((item) => (
             <Link
               key={item.href + item.label}
               href={item.href}
